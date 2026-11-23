@@ -1,0 +1,86 @@
+name: Windows tests and build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag, for example v0.1.0. Leave blank for a CI build.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || '' }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dependencies
+        run: python -m pip install ".[build]"
+      - name: Run unit tests
+        run: python -m pytest -q
+      - name: Build and smoke-test both executables
+        id: package
+        run: python scripts/build.py
+      - uses: actions/upload-artifact@v7
+        id: upload
+        with:
+          path: ${{ steps.package.outputs.archive_path }}
+          archive: false
+          if-no-files-found: error
+          overwrite: true
+
+  release:
+    if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v'))
+      || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ needs.windows.outputs.artifact_id }}
+          path: dist
+          skip-decompress: true
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          archive="dist/gostinator-${RELEASE_TAG#v}-windows-x64.zip"
+          if [[ "$RELEASE_TAG" != v* || ! -s "$archive" ]]; then
+            echo "::error::Use v followed by the version in pyproject.toml. Expected $archive."
+            exit 1
+          fi
+
+          if assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'); then
+            if ! grep -Fxq -- "${archive##*/}" <<< "$assets"; then
+              gh release upload "$RELEASE_TAG" "$archive"
+            fi
+            draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
+            if [[ "$draft" == true ]]; then
+              gh release edit "$RELEASE_TAG" --draft=false
+            fi
+          else
+            gh release create "$RELEASE_TAG" "$archive" --verify-tag --generate-notes
+          fi
