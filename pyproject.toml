@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gostinator"
+version = "0.1.0"
+description = "Batch conversion of SolidWorks parts to drawings and PDF"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = ["pywin32==312"]
+
+[project.optional-dependencies]
+build = ["pytest==9.2.0", "pyinstaller==6.22.3"]
+
+[project.scripts]
+gostinator = "gostinator.cli:main"
+
+[project.gui-scripts]
+gostinator-ui = "gostinator.ui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

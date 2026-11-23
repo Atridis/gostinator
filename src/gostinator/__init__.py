@@ -1,0 +1,1 @@
+"""Gostinator for Windows."""
