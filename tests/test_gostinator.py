@@ -108,6 +108,9 @@ def test_convert_uses_native_projection_and_keeps_user_document_open(
         Create1stAngleViews2=Mock(spec=lambda path: None, return_value=True),
         Create3rdAngleViews2=Mock(spec=lambda path: None, return_value=True),
         InsertModelAnnotations3=Mock(spec=lambda *args: None),
+        GetUserPreferenceToggle=lambda setting: setting == solidworks.SW_DISPLAY_ORIGINS,
+        SetUserPreferenceToggle=Mock(spec=lambda *_: None, return_value=True),
+        GraphicsRedraw2=Mock(spec=lambda: None),
         ClearSelection2=Mock(spec=lambda value: None),
         Extension=SimpleNamespace(SaveAs=Mock(spec=save, side_effect=save)),
     )
@@ -126,6 +129,8 @@ def test_convert_uses_native_projection_and_keeps_user_document_open(
     expected = drawing.Create1stAngleViews2 if first_angle else drawing.Create3rdAngleViews2
     expected.assert_called_once_with(str(part))
     drawing.InsertModelAnnotations3.assert_called_once_with(0, 32768, True, False, False, False)
+    drawing.SetUserPreferenceToggle.assert_called_once_with(solidworks.SW_DISPLAY_ORIGINS, False)
+    drawing.GraphicsRedraw2.assert_called_once_with()
     assert [args.args[0] for args in app.CloseDoc.call_args_list] == (
         ["drawing"] if already_open else ["drawing", "part"])
     if already_open:
