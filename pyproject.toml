@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gostinator"
-version = "0.2.0"
+version = "0.2.1"
 description = "Batch conversion of SolidWorks parts to drawings and PDF"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
