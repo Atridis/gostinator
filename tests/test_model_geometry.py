@@ -4,8 +4,10 @@ from types import SimpleNamespace
 import pytest
 
 from gostinator.drawing_dimensions import (
-    Anchor, Line, Task, _blank_extent_tasks, _corner_cut_tasks, _geometry_key, _overall_tasks, _recess_tasks,
-    _section_frame, _select_section_edge, _stock_span_tasks,
+    Anchor, Line, Task, _blank_extent_tasks, _corner_cut_tasks, _folded_profile_shift, _geometry_key,
+    _overall_tasks, _physical_profile_key, _recess_tasks,
+    _section_datums, _section_depth_task, _section_frame, _select_section_edge, _stock_span_tasks,
+    prune_duplicate_bore_diameters,
 )
 from gostinator.drawing_views import project
 from gostinator.model_geometry import Bore, Model, _read_cylinders, choose_section, needs_reverse, primary_axis
@@ -30,6 +32,41 @@ def test_view_choice_prioritizes_a_row_of_real_bores():
     assert primary_axis(rotated) == 2
     assert choose_section(rotated, 2).along == 1
     assert choose_section(Model(model.bounds, model.bores, True), 2) is None
+
+
+@pytest.mark.parametrize(("same_profile", "cut_visible", "extra_text", "removed"), [
+    (True, True, "", 1),
+    (False, True, "", 0),
+    (True, False, "", 0),
+    (True, True, " H7", 0),
+])
+def test_section_diameter_only_replaces_a_plain_projection_of_the_same_step(
+        same_profile, cut_visible, extra_text, removed):
+    left = _bore((-.021, 0), .003, 0, .013)
+    right = _bore((.021, 0), .003, 0, .013)
+    model = Model((-.040, -.010, 0, .040, .010, .022), (
+        left, right, _bore(left.center, .007, .013, .022),
+        _bore(right.center, .007 if same_profile else .008, .013, .022),
+    ), False)
+    matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, .10, .12, 0, 2., 0, 0, 0)
+    center = project(right.point(right.low), matrix)
+    text = ("<MOD-DIAM>", "6", extra_text)
+    data = SimpleNamespace(
+        GetTextCount=len(text), GetTextAtIndex=text.__getitem__,
+        GetArrowHeadCount=2,
+        GetArrowHeadAtIndex2=lambda i: (center[0] + (2*i - 1)*.006, *center[1:]),
+    )
+    front = SimpleNamespace(Visible=1, IsDangling=False, GetDisplayData=data)
+    cut = SimpleNamespace(Visible=1 if cut_visible else 3, IsDangling=False, GetDisplayData=data)
+    dimension = SimpleNamespace(GetSystemValue2=lambda _: .006)
+    display = SimpleNamespace(Type2=6, GetAnnotation=front, GetDimension2=lambda _: dimension)
+    view = SimpleNamespace(Type=7, GetDisplayDimensions=(display,),
+                           ModelToViewTransform=SimpleNamespace(ArrayData=matrix))
+    doc = SimpleNamespace(GetViews=((None, view),))
+
+    assert prune_duplicate_bore_diameters(doc, model, [(left, cut)]) == removed
+    assert front.Visible == (3 if removed else 1)
+    assert cut.Visible == (1 if cut_visible else 3)
 
 
 def test_opposite_face_only_for_distinct_backside_openings():
@@ -103,6 +140,31 @@ def test_opposite_views_deduplicate_the_same_span_but_keep_an_independent_span()
     assert original == _geometry_key(measure(.02, 0), back, 2)
     assert original != _geometry_key(measure(.03, 0), back, 2)
     assert original != _geometry_key(measure(.02, 0), back, 2, "Flat pattern")
+
+
+def test_perpendicular_views_recognize_the_same_physical_profile_edge_after_registration():
+    front = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+    top = (1, 0, 0, 0, 0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0)
+
+    def profile(matrix, depth, offset):
+        points = ((.002, 0., depth), (.021, 0., depth))
+        points = [tuple(a + b for a, b in zip(point, offset)) for point in points]
+        anchors = tuple(Anchor(object(), point, project(point, matrix)) for point in points)
+        return Task(anchors, 2, .019, 0, profile=True)
+
+    side_offset = (.10, .22, 0.)
+    top_offset = (.10, .14, 0.)
+    key = _physical_profile_key(profile(front, .05, side_offset), front, side_offset)
+    assert key == _physical_profile_key(profile(top, .05, top_offset), top, top_offset)
+    assert key != _physical_profile_key(profile(top, .04, top_offset), top, top_offset)
+
+
+def test_folded_view_registration_checks_the_available_stock_extents():
+    model = Model((0., 0., 0., .110, .040, .050), (), True)
+    shifted = (Anchor(None, (.112, .170, .02), ()),
+               Anchor(None, (.222, .210, .05), ()))
+    assert _folded_profile_shift(shifted, model, 2, (.112, .170)) == (.112, .170, 0.)
+    assert _folded_profile_shift(shifted, model, 2, (.112, .182)) is None
 
 
 def test_corner_cutback_needs_two_perpendicular_incident_rails():
@@ -179,3 +241,23 @@ def test_section_body_translation_is_corrected_using_its_native_contour():
     effective, shift = _section_frame(vertices, model, 1, matrix, (.04, .1, .10, .116))
     assert shift == pytest.approx((.14, .085, 0.))
     assert project(vertices[-1].model, effective)[:2] == pytest.approx((.1, .116))
+
+
+@pytest.mark.parametrize("axis,sign", ((0, 1), (1, -1)))
+def test_counterbore_depth_measures_the_face_and_shoulder_across_chamfers(axis, sign):
+    coords = [(.000, .008), (.000, .004), (.0002, .0038), (.0075, .0038),
+              (.008, .0043), (.008, .0055), (.0177, .0055), (.018, .0058), (.018, .009)]
+    anchors = []
+    for axial, radial in coords:
+        point = (sign*axial, radial, 0.) if axis == 0 else (radial, sign*axial, 0.)
+        anchors.append(Anchor(object(), point, point))
+    lines = tuple(Line(object(), (a, b)) for a, b in zip(anchors, anchors[1:]))
+    datums = _section_datums(lines, axis, 1.)
+    task = _section_depth_task(anchors[5:7], 0., 1-axis, 1., datums)
+    assert task.projected and task.direction == axis
+    assert task.nominal == pytest.approx(.010)
+    assert task.targets == (anchors[5], anchors[7])
+    assert _section_depth_task(anchors[2:4], 0., 1-axis, 1., datums) is None
+
+    missing_face = _section_datums(lines[:-1], axis, 1.)
+    assert _section_depth_task(anchors[5:7], 0., 1-axis, 1., missing_face) is None

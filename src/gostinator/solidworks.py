@@ -175,8 +175,8 @@ class NativeDraftError(RuntimeError):
 
 
 def _generate_drawing(app, part, template, staging, model, *, writable_flat_source=None):
-    from .annotation_layout import arrange_dimensions
-    from .drawing_dimensions import add_dimensions, prune_model_dimensions
+    from .annotation_layout import arrange_dimensions, omit_repeated_section_scales, set_black_dimension_color
+    from .drawing_dimensions import add_dimensions, prune_duplicate_bore_diameters, prune_model_dimensions
     from .drawing_views import create_flat_pattern, create_views, sheet_frame
     from .sheet_layout import (
         Layout, PAPERS, Paper, choose_layout, configure_sheet, installed_formats,
@@ -219,6 +219,7 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
             raise NativeDraftError(str(exc)) from exc
         if layout is not None:
             synchronize_sheet_scale(drawing, layout.scale)
+            omit_repeated_section_scales(drawing)
         try:
             get_value(drawing, "InsertModelAnnotations3", SW_IMPORT_FROM_ENTIRE_MODEL,
                       SW_DIMENSIONS_MARKED_FOR_DRAWING, True, False, False, False)
@@ -233,8 +234,11 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
         if model is not None:
             try:
                 skipped = prune_model_dimensions(drawing)
-                count = add_dimensions(drawing, model, frame)
+                count, cut_diameters = add_dimensions(drawing, model, frame)
                 visible, moved, hidden = arrange_dimensions(drawing, frame)
+                duplicates = prune_duplicate_bore_diameters(drawing, model, cut_diameters)
+                visible -= duplicates
+                skipped += duplicates
             except (AttributeError, RuntimeError, com_error) as exc:
                 raise NativeDraftError(str(exc)) from exc
             print(f"    Размеров по геометрии — {count}, повторных и висячих скрыто — {skipped}",
@@ -248,6 +252,10 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
         get_value(drawing, "ClearSelection2", True)
         fit_title_block(drawing, frame)
         _hide_reference_markers(drawing)
+        try:
+            set_black_dimension_color(drawing)
+        except (AttributeError, com_error) as exc:
+            print(f"[WARN] Не удалось задать чёрный цвет размеров — {exc}", flush=True)
         _save(drawing, target)
         _save(drawing, pdf)
     finally:

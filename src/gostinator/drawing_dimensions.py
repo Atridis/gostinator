@@ -2,13 +2,14 @@
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from math import acos, dist, isclose, tau
+from re import fullmatch
 
 from pythoncom import VT_DISPATCH, com_error
 from win32com.client import VARIANT
 
-from .annotation_layout import geometry_outline, view_strokes
+from .annotation_layout import geometry_outline, view_strokes, visible_dimensions
 from .drawing_views import drawing_views, project, transform_of
-from .model_geometry import POSITION_TOLERANCE as TOLERANCE, axis_of, choose_section, primary_axis
+from .model_geometry import Bore, POSITION_TOLERANCE as TOLERANCE, axis_of, choose_section, primary_axis
 from .solidworks import as_dispatch, get_value
 
 
@@ -51,6 +52,8 @@ class Task:
     direction: int
     projected: bool = False
     overall: bool = False
+    bore: Bore | None = None
+    profile: bool = False
 
 
 def _optional(obj, name, *args):
@@ -79,6 +82,10 @@ def _section_silhouettes(view, matrix):
                                    for p in coords), True)
 
 
+def _point_key(point):
+    return tuple(round(value / TOLERANCE) for value in point[:3])
+
+
 def _anchors(view, matrix):
     vertices = {}
     circles = []
@@ -86,8 +93,7 @@ def _anchors(view, matrix):
     for vertex in _visible(view, 2):
         point = _optional(vertex, "GetPoint")
         if point and len(point) >= 3:
-            vertices[tuple(round(value / TOLERANCE) for value in point[:3])] = Anchor(
-                vertex, tuple(point[:3]), project(point, matrix))
+            vertices[_point_key(point)] = Anchor(vertex, tuple(point[:3]), project(point, matrix))
     for edge in _visible(view, 1):
         curve = _optional(edge, "GetCurve")
         if curve is None:
@@ -112,8 +118,7 @@ def _anchors(view, matrix):
                 point = _optional(vertex, "GetPoint") if vertex is not None else None
                 if point and len(point) >= 3:
                     ends.append(vertices.setdefault(
-                        tuple(round(value / TOLERANCE) for value in point[:3]),
-                        Anchor(vertex, tuple(point[:3]), project(point, matrix))))
+                        _point_key(point), Anchor(vertex, tuple(point[:3]), project(point, matrix))))
             if len(ends) == 2:
                 lines.append(Line(edge, tuple(ends)))
     return list(vertices.values()), circles, lines
@@ -151,6 +156,44 @@ def _geometry_key(task, matrix, normal, view_scope=None):
     return view_scope, kind, value, normal, world_axis, anchors
 
 
+def _folded_profile_shift(vertices, model, normal, position):
+    if not vertices:
+        return None
+    limits = [(min(values), max(values)) for values in zip(*(v.model for v in vertices))]
+    tolerance = 4 * TOLERANCE
+    if all(abs(high - low - model.spans[i]) <= tolerance
+           for i, (low, high) in enumerate(limits)):
+        return tuple(low - model.bounds[i] for i, (low, _) in enumerate(limits))
+    # SolidWorks can return the drawing body's vertices with the view's
+    # sheet-position translation. Only use that origin if the two visible
+    # stock extents match and every sampled vertex lies inside the body.
+    shifts = [(0., 0., 0.)]
+    if position and len(position) >= 2 and dist(position[:2], (0., 0.)) > tolerance:
+        shifts.append((*position[:2], 0.))
+    matches = []
+    for shift in shifts:
+        gaps = [(low - shift[i] - model.bounds[i], model.bounds[i+3] - (high - shift[i]))
+                for i, (low, high) in enumerate(limits)]
+        if all(min(pair) >= -tolerance and (i == normal or max(pair) <= tolerance)
+               for i, pair in enumerate(gaps)):
+            matches.append(shift)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _physical_profile_key(task, matrix, shift):
+    axis = axis_of(matrix[task.direction:9:3])
+    if axis is None:
+        return None
+    points = (_point_key(tuple(value - delta for value, delta in zip(anchor.model, shift)))
+              for anchor in task.targets)
+    return axis, tuple(sorted(points))
+
+
+def _profile_interval(profile):
+    axis, ends = profile
+    return axis, tuple(sorted(point[axis] for point in ends))
+
+
 def prune_model_dimensions(doc):
     """Keep one display of each model dimension and hide dangling marks."""
     names = set()
@@ -175,6 +218,84 @@ def _hide(annotation):
         return _optional(annotation, "Visible") == HIDDEN
     except (AttributeError, com_error):
         return False
+
+
+def _section_bore_keys(section):
+    coaxial = defaultdict(list)
+    for bore in section.bores:
+        coaxial[_point_key(bore.point(0.))].append(bore)
+    keys = {}
+    for group in coaxial.values():
+        segments = {bore: _point_key((bore.radius, bore.low, bore.high)) for bore in group}
+        profile = tuple(sorted(segments.values()))
+        stepped = len({radius for radius, _, _ in profile}) > 1
+        for bore, segment in segments.items():
+            # Repeated stepped holes in the same cut can share a callout
+            # only when the complete cylindrical profiles agree.
+            keys[bore] = ((profile, segment) if stepped else bore, stepped)
+    return keys
+
+
+def _plain_diameter(data, nominal):
+    if data is None:
+        return False
+    parts = [_optional(data, "GetTextAtIndex", i)
+             for i in range(_optional(data, "GetTextCount") or 0)]
+    if not all(isinstance(part, str) for part in parts):
+        return False
+    match = fullmatch(r"(?:<MOD-DIAM>|[Ø⌀∅])\s*(\d+(?:[.,]\d+)?)",
+                      "".join(parts).strip())
+    return bool(match and isclose(float(match[1].replace(",", ".")) / 1000, nominal,
+                                  abs_tol=TOLERANCE))
+
+
+def _projected_bore(data, nominal, matrix, bores):
+    if _optional(data, "GetArrowHeadCount") != 2:
+        return None
+    tips = [_optional(data, "GetArrowHeadAtIndex2", i) for i in range(2)]
+    if not all(tip and len(tip) >= 2 for tip in tips):
+        return None
+    scale = matrix[12]
+    if not isclose(dist(tips[0][:2], tips[1][:2]), nominal * scale, abs_tol=TOLERANCE * scale):
+        return None
+    center = tuple((a + b) / 2 for a, b in zip(tips[0][:2], tips[1][:2]))
+    axis = axis_of(matrix[2:9:3])
+    matches = [bore for bore in bores
+               if bore.axis == axis and isclose(2 * bore.radius, nominal, abs_tol=TOLERANCE)
+               and dist(project(bore.point(bore.low), matrix)[:2], center) <= TOLERANCE * scale]
+    return matches[0] if len(matches) == 1 else None
+
+
+def prune_duplicate_bore_diameters(doc, model, cut_diameters):
+    """Keep one plain diameter across a section and its ordinary projections."""
+    if not cut_diameters:
+        return 0
+    section = choose_section(model, primary_axis(model))
+    if section is None:
+        return 0
+    keys = _section_bore_keys(section)
+    visible_cut = {}
+    for bore, annotation in cut_diameters:
+        if (_optional(annotation, "Visible") == VISIBLE and not _optional(annotation, "IsDangling")
+                and _plain_diameter(_optional(annotation, "GetDisplayData"), 2 * bore.radius)):
+            visible_cut[keys[bore]] = annotation
+    if not visible_cut:
+        return 0
+    removed = 0
+    for item in visible_dimensions(doc):
+        if (item.kind != DIAMETER or item.dimension is None or _optional(item.view, "Type") == 2
+                or _optional(item.view, "IsFlatPatternView") or _optional(item.annotation, "IsDangling")):
+            continue
+        data = _optional(item.annotation, "GetDisplayData")
+        value = _optional(item.dimension, "GetSystemValue2", "")
+        if not isinstance(value, (int, float)) or not _plain_diameter(data, value):
+            continue
+        bore = _projected_bore(data, value, transform_of(item.view), model.bores)
+        key = keys.get(bore)
+        cut = visible_cut.get(key)
+        if cut is not None and _optional(cut, "Visible") == VISIBLE:
+            removed += _hide(item.annotation if key[1] else cut)
+    return removed
 
 
 def _pair_on_axis(anchors, at_low, at_high, direction, tolerance):
@@ -312,7 +433,7 @@ def _profile_tasks(lines, matrix):
         direction = 0 if delta[0] >= delta[1] else 1
         nominal = delta[direction] / scale
         if delta[1-direction] <= tolerance and nominal >= .004:
-            candidates[direction].append(Task(line.ends, LINEAR, nominal, direction))
+            candidates[direction].append(Task(line.ends, LINEAR, nominal, direction, profile=True))
     for tasks in candidates.values():
         # Allow one task per physical length family. Prefer longer, more
         # useful profile spans before short steps compete for space.
@@ -548,7 +669,62 @@ def _section_frame(vertices, model, normal, matrix, box):
     return matrix, tuple(shift)
 
 
-def _section_tasks(vertices, lines, model, normal, matrix, shift=(0., 0., 0.)):
+def _section_datums(lines, depth, scale):
+    """Find transverse faces and vertices whose axial walls stop at an edge break."""
+    tolerance = max(TOLERANCE*scale, 1e-6)
+    planes = defaultdict(list)
+    diagonals = []
+    for first, second in (line.ends for line in lines):
+        dx, dy, dz = (abs(a-b) for a, b in zip(first.sheet, second.sheet))
+        if dz > tolerance or (dx, dy)[1-depth] <= tolerance:
+            continue
+        if (dx, dy)[depth] <= tolerance:
+            planes[_point_key(first.model)].append((first, second))
+            planes[_point_key(second.model)].append((second, first))
+        else:
+            diagonals.append((first, second))
+    trimmed = defaultdict(list)
+    for first, second in diagonals:
+        for wall, face in ((first, second), (second, first)):
+            trimmed[_point_key(wall.model)].extend(planes.get(_point_key(face.model), ()))
+    return planes, trimmed
+
+
+def _section_depth_task(pair, center, direction, scale, datums):
+    depth = 1-direction
+    planes, trimmed = datums
+    tolerance = max(TOLERANCE*scale, 1e-6)
+    keys = [_point_key(anchor.model) for anchor in pair]
+    raw = abs(pair[1].sheet[depth]-pair[0].sheet[depth])
+    if not any(key in trimmed and key not in planes for key in keys):
+        return Task(pair, LINEAR, raw/scale, depth)
+
+    # The end at a face opening continues away from the bore centre. The
+    # shoulder at the bottom of the larger bore continues towards it.
+    radial_sign = 1 if pair[0].sheet[direction] > center else -1
+    faces = []
+    for anchor, other, key in zip(pair, reversed(pair), keys):
+        outward = 1 if anchor.sheet[depth] > other.sheet[depth] else -1
+        candidates = [(near, radial_sign*(far.sheet[direction]-near.sheet[direction]) > 0.)
+                      for near, far in planes.get(key) or trimmed.get(key, ())
+                      if outward*(near.sheet[depth]-anchor.sheet[depth]) >= -tolerance]
+        if not candidates:
+            return None
+        datum, entry = candidates[0]
+        if any(role != entry or abs(point.sheet[depth]-datum.sheet[depth]) > tolerance
+               for point, role in candidates[1:]):
+            return None
+        faces.append((datum, entry))
+    (first, first_entry), (second, second_entry) = faces
+    if first_entry == second_entry:
+        # Two openings are a through bore, or the remaining wall under a
+        # counterbore. Leave it to the stock and counterbore dimensions.
+        return None
+    return Task((first, second), LINEAR, abs(second.sheet[depth]-first.sheet[depth])/scale,
+                depth, projected=True)
+
+
+def _section_tasks(vertices, lines, model, normal, matrix, shift=(0., 0., 0.), *, datums):
     axis = primary_axis(model)
     section = choose_section(model, axis)
     if section is None or normal in (axis, section.along):
@@ -570,9 +746,9 @@ def _section_tasks(vertices, lines, model, normal, matrix, shift=(0., 0., 0.)):
         pair = _pair_on_axis(ends, center - half_width, center + half_width, direction, tolerance)
         wall_pair = _section_walls(lines, bore, center, half_width, direction, tolerance)
         if wall_pair:
-            yield Task(wall_pair, LINEAR, 2 * bore.radius, direction, projected=True)
+            yield Task(wall_pair, LINEAR, 2 * bore.radius, direction, projected=True, bore=original)
         if pair:
-            yield Task(pair, LINEAR, 2 * bore.radius, direction, projected=True)
+            yield Task(pair, LINEAR, 2 * bore.radius, direction, projected=True, bore=original)
         if not wall_pair and not pair:
             # Some builds omit cut entities. Predict wall hit points, then
             # validate the selected edge at each point before dimensioning.
@@ -583,14 +759,14 @@ def _section_tasks(vertices, lines, model, normal, matrix, shift=(0., 0., 0.)):
                 sheet_point = list(middle)
                 sheet_point[direction] += sign * half_width
                 targets.append(Anchor(None, point, tuple(sheet_point)))
-            yield Task(tuple(targets), LINEAR, 2 * bore.radius, direction, projected=True)
+            yield Task(tuple(targets), LINEAR, 2 * bore.radius, direction, projected=True, bore=original)
         depths = sorted(
             project(bore.point(z), matrix)[1 - direction] for z in (bore.low, bore.high)
         )
         wall = [v for v in vertices if abs(abs(v.sheet[direction] - center) - half_width) <= tolerance]
         pair = _pair_on_axis(wall, *depths, 1 - direction, tolerance)
-        if pair:
-            yield Task(pair, LINEAR, bore.high - bore.low, 1 - direction)
+        if pair and (depth := _section_depth_task(pair, center, direction, matrix[12], datums)):
+            yield depth
 
 
 def _section_walls(lines, bore, center, half_width, direction, tolerance):
@@ -636,7 +812,7 @@ def _create(doc, view, task, position, matrix):
     get_value(doc, "ClearSelection2", True)
     manager = get_value(doc, "SelectionManager")
     if not get_value(doc, "ActivateView", get_value(view, "GetName2")):
-        return False
+        return None
     section = get_value(view, "Type") == 2
     for index, target in enumerate(task.targets):
         if target.entity is None:
@@ -658,9 +834,9 @@ def _create(doc, view, task, position, matrix):
                     else:
                         selected = _select_section_edge(doc, view, manager, target, index, matrix)
         if not selected:
-            return False
+            return None
     if get_value(manager, "GetSelectedObjectCount2", -1) != len(task.targets):
-        return False
+        return None
     if task.projected:
         method = "AddHorizontalDimension2" if task.direction == 0 else "AddVerticalDimension2"
     else:
@@ -668,7 +844,7 @@ def _create(doc, view, task, position, matrix):
             task.kind, "AddDimension2")
     display = get_value(doc, method, *position, 0.)
     if display is None:
-        return False
+        return None
     dimension = _optional(display, "GetDimension2", 0)
     annotation = _optional(display, "GetAnnotation")
     value = _optional(dimension, "GetSystemValue2", "") if dimension is not None else None
@@ -677,9 +853,9 @@ def _create(doc, view, task, position, matrix):
     if (linked is not None and linked >= len(task.targets) and kind is not None
             and value is not None and _key(kind, value)[0] == task.kind
             and isclose(value, task.nominal, abs_tol=TOLERANCE, rel_tol=1e-5)):
-        return True
+        return annotation
     _discard(doc, view, display, annotation)
-    return False
+    return None
 
 
 def _select_section_at(doc, view, manager, target, index, kind):
@@ -753,17 +929,19 @@ def _discard(doc, view, display, annotation):
 
 def add_dimensions(doc, model, frame):
     if model is None:
-        return 0
+        return 0, []
     views = [(view, bool(_optional(view, "IsFlatPatternView"))) for view in drawing_views(doc)]
     views.sort(key=lambda item: item[1])
     if any(flat for _, flat in views):
         get_value(doc, "ViewZoomtofit2")
     created_geometry = set()
+    created_profiles = set()
     # These generated labels get their lanes first. Imported labels will be
     # moved around them by the native text layout after dimensioning.
     text = []
     boxes = [tuple(get_value(view, "GetOutline")[:4]) for view, _ in views]
     added = 0
+    cut_diameters = []
     for (view, flat), box in zip(views, boxes):
         matrix = transform_of(view)
         normal = axis_of(matrix[2:9:3])
@@ -774,6 +952,8 @@ def add_dimensions(doc, model, frame):
         view_scope = get_value(view, "GetName2") if section or flat else None
         imported = _existing(view)
         created_in_view = set()
+        profile_shift = (_folded_profile_shift(vertices, model, normal, _optional(view, "Position"))
+                         if model.sheet_metal and view_scope is None else None)
         if section:
             matrix, shift = _section_frame(vertices, model, normal, matrix, box)
             def reproject(anchor):
@@ -786,29 +966,51 @@ def add_dimensions(doc, model, frame):
         else:
             tasks = list(_overall_tasks(vertices, matrix))
             if section:
+                model_axis = primary_axis(model)
+                depth_direction = max((0, 1), key=lambda i: abs(matrix[3*model_axis+i]))
+                datums = _section_datums(lines, depth_direction, matrix[12])
                 cut_lines = lines + list(_section_silhouettes(view, matrix))
-                tasks.extend(_section_tasks(vertices, cut_lines, model, normal, matrix, shift))
+                tasks.extend(_section_tasks(vertices, cut_lines, model, normal, matrix, shift, datums=datums))
             else:
                 tasks.extend(_recess_tasks(lines, matrix))
                 tasks.extend(_stock_span_tasks(lines, matrix))
                 tasks.extend(_hole_tasks(circles, lines, model, normal, matrix))
                 tasks.extend(_profile_radii(circles, lines, vertices, normal, matrix))
             tasks.extend(_corner_cut_tasks(lines, matrix))
-            tasks.extend(_profile_tasks(lines, matrix))
+            for task in _profile_tasks(lines, matrix):
+                if section and task.direction == depth_direction and any(
+                        (point := _point_key(anchor.model)) in datums[1] and point not in datums[0]
+                        for anchor in task.targets):
+                    continue
+                tasks.append(task)
             tasks.extend(_aligned_width_tasks(lines, matrix))
+        profiles = {id(task): _physical_profile_key(task, matrix, profile_shift)
+                    for task in tasks if task.profile} if profile_shift is not None else {}
+        # If an edge is already dimensioned, omit parallel candidates at
+        # the same stations in this view as well.
+        covered_profile_spans = {_profile_interval(profile) for profile in profiles.values()
+                                 if profile is not None and profile in created_profiles}
         for task in tasks:
             key = _key(task.kind, task.nominal)
             local = (key, task.direction if task.kind == LINEAR else None)
             geometry = _geometry_key(task, matrix, normal, view_scope)
             if key in imported or local in created_in_view or geometry in created_geometry:
                 continue
+            profile = profiles.get(id(task))
+            if profile is not None and _profile_interval(profile) in covered_profile_spans:
+                continue
             position = _label(task, box, boxes, text, frame)
             if position is None:
                 continue
-            if _create(doc, view, task, position, matrix):
+            annotation = _create(doc, view, task, position, matrix)
+            if annotation is not None:
                 added += 1
+                if task.bore is not None:
+                    cut_diameters.append((task.bore, annotation))
                 created_in_view.add(local)
                 created_geometry.add(geometry)
+                if profile is not None:
+                    created_profiles.add(profile)
                 text.append(position)
         get_value(doc, "ClearSelection2", True)
-    return added
+    return added, cut_diameters

@@ -1,8 +1,9 @@
 """Arrange dimension labels against native text and view geometry."""
 from collections import defaultdict, namedtuple
 from dataclasses import dataclass, replace
-from math import cos, dist, hypot, isfinite, sin
+from math import cos, dist, hypot, isclose, isfinite, sin
 from pathlib import Path
+from re import sub
 
 from pythoncom import VT_BYREF, VT_VARIANT, com_error
 from win32com.client import VARIANT
@@ -40,6 +41,15 @@ def visible_dimensions(doc):
             if annotation is not None and optional(annotation, "Visible") == 1:
                 dimension = optional(display, "GetDimension2", 0)
                 yield VisibleDimension(view, display, annotation, dimension, optional(display, "Type2"))
+
+
+def set_black_dimension_color(doc):
+    dimensions = list(visible_dimensions(doc))
+    for item in dimensions:
+        # Set an explicit drawing color so driven and imported sizes agree.
+        item.annotation.Color = 0  # black COLORREF
+    if dimensions:
+        get_value(doc, "GraphicsRedraw2")
 
 
 def text_extent(parts):
@@ -212,7 +222,10 @@ def _fits_detail(box, allowed, other_boxes, used, own, model_strokes):
             and not any(crosses(line, padded) for line in model_strokes))
 
 
-def _routes_fit(box, strokes, foreign_views, occupied):
+def _routes_fit(box, strokes, foreign_views, occupied, *, text_clearance=0.):
+    if text_clearance:
+        x0, y0, x1, y1 = box
+        box = (x0-text_clearance, y0-text_clearance, x1+text_clearance, y1+text_clearance)
     for text, lines in occupied:
         if any(crosses(new, text) for new in strokes) or any(crosses(old, box) for old in lines):
             return False
@@ -238,16 +251,34 @@ def format_zones(doc, frame):
     return tuple(zones)
 
 
-def section_captions(view):
+def _section_label_notes(view):
     if get_value(view, "Type") != 2:
         return
     for raw in optional(view, "GetNotes") or ():
         note = as_dispatch(raw)
         linked = str(optional(note, "PropertyLinkedText") or "")
         if "<VLLABEL>" in linked:
-            annotation = optional(note, "GetAnnotation")
-            if annotation is not None and optional(annotation, "Visible") == 1:
-                yield annotation
+            yield note, linked
+
+
+def section_captions(view):
+    for note, _ in _section_label_notes(view):
+        annotation = optional(note, "GetAnnotation")
+        if annotation is not None and optional(annotation, "Visible") == 1:
+            yield annotation
+
+
+def omit_repeated_section_scales(doc):
+    sheet = get_value(doc, "GetCurrentSheet")
+    properties = get_value(sheet, "GetProperties2")
+    sheet_scale = properties[2] / properties[3]
+    for view in drawing_views(doc):
+        if optional(view, "Type") != 2 or not isclose(get_value(view, "ScaleDecimal"), sheet_scale):
+            continue
+        for note, linked in _section_label_notes(view):
+            label = sub(r"\s*\((?:\s*<VLSCALEV?>)+\s*\)|(?:\s*<VLSCALEV?>)+", "", linked)
+            if label != linked:
+                note.PropertyLinkedText = label
 
 
 def section_line_zones(view):
@@ -597,6 +628,30 @@ def _radius_arc(arrow, radius, geometry):
     return (), tolerance
 
 
+def _doubled_diameter_leader(item, strokes):
+    if item.kind != 6:
+        return False
+    data = optional(item.annotation, "GetDisplayData")
+    if data is None or optional(data, "GetArrowHeadCount") != 2:
+        return False
+    arrows = [optional(data, "GetArrowHeadAtIndex2", i) for i in range(2)]
+    if not all(arrow and len(arrow) >= 2 and all(map(isfinite, arrow[:2])) for arrow in arrows):
+        return False
+    tips = [arrow[:2] for arrow in arrows]
+    radius = dist(*tips) / 2
+    center = tuple((a+b)/2 for a, b in zip(*tips))
+    tolerance = min(.001, .10*radius)
+    branches = []
+    for line in strokes:
+        first, last = sorted(line, key=lambda p: dist(p, center))
+        if abs(dist(first, center)-radius) <= tolerance and dist(last, center) > radius+.002:
+            branches.append((first, last))
+    # A two-arrow diameter has one outward branch on each side. A second
+    # branch leaving the same arc and diverging beside the text is stray.
+    return any(dist(a, c) <= .5*radius and dist(b, d) > tolerance
+               for i, (a, b) in enumerate(branches) for c, d in branches[i+1:])
+
+
 def _spread_callouts(placed, occupied, outlines, edges, reserved, allowed):
     moved = 0
     for index, (item, name, _) in enumerate(placed):
@@ -609,10 +664,16 @@ def _spread_callouts(placed, occupied, outlines, edges, reserved, allowed):
         others = occupied[:index] + occupied[index+1:]
         used = [label for label, _ in others]
         score, count = _callout_crowding(box, used)
-        if count < 2 or score < .25:
+        doubled = _doubled_diameter_leader(item, strokes)
+        if not doubled and (count < 2 or score < .25):
             continue
         foreign = (*reserved, *(outline for owner, outline in outlines.items() if owner != name))
-        options = _callout_positions(box, own, allowed, foreign, used, score)
+        options = _callout_positions(box, own, allowed, foreign, used,
+                                     float("inf") if doubled else score)
+        if doubled:
+            nearby = [(0., dx, dy) for delta in (.004, -.004, .006, -.006, .008, -.008, .014, -.014)
+                      for dx, dy in ((0., delta), (delta, 0.))]
+            options = nearby + options
         if not options:
             continue
         original = optional(item.annotation, "GetPosition")
@@ -641,11 +702,13 @@ def _spread_callouts(placed, occupied, outlines, edges, reserved, allowed):
                 if arrow is None or not any(_distance_to_stroke(arrow[:2], stroke) <= tolerance for stroke in arc):
                     continue
             if (fits(actual, allowed, (own, *foreign), used) and lines
-                    and _callout_crowding(actual, used)[0] < score-.12
+                    and (doubled or _callout_crowding(actual, used)[0] < score-.12)
                     and sum(dist(*line) for line in lines) <= max(length*1.35, length+.018)
-                    and _routes_fit(actual, lines, foreign, others)
+                    and _routes_fit(actual, lines, foreign, others,
+                                    text_clearance=.002 if doubled else 0.)
                     and _line_crossings(lines, neighboring_lines) <= crossings
                     and _line_crossings(lines, geometry) <= geometry_crossings
+                    and not _doubled_diameter_leader(item, lines)
                     and not optional(item.annotation, "IsDangling")):
                 occupied[index] = (actual, lines)
                 moved += 1

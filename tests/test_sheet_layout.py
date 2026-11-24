@@ -83,6 +83,53 @@ def test_existing_native_format_is_preserved_on_matching_sheet_size():
     assert scale == [(2., 1., False, False)]
 
 
+@pytest.mark.parametrize("scale_tags", (" <VLSCALE><VLSCALEV>", " (<VLSCALEV>)"))
+def test_section_caption_shows_scale_only_if_different_from_the_sheet(scale_tags):
+    linked = "<VLNAME><VLLABEL>" + scale_tags
+    same_scale = SimpleNamespace(PropertyLinkedText=linked)
+    different_scale = SimpleNamespace(PropertyLinkedText=linked)
+    ordinary_note = SimpleNamespace(PropertyLinkedText="Проверочный текст <VLSCALE>")
+    sheet = SimpleNamespace(GetProperties2=(7, 12, 4., 2., True, .210, .297))
+    views = (
+        None,
+        SimpleNamespace(Type=2, ScaleDecimal=2., GetNotes=(same_scale, ordinary_note)),
+        SimpleNamespace(Type=2, ScaleDecimal=4., GetNotes=(different_scale,)),
+    )
+    drawing = SimpleNamespace(GetCurrentSheet=sheet, GetViews=(views,))
+    annotation_layout.omit_repeated_section_scales(drawing)
+    assert same_scale.PropertyLinkedText == "<VLNAME><VLLABEL>"
+    assert different_scale.PropertyLinkedText == linked
+    assert ordinary_note.PropertyLinkedText == "Проверочный текст <VLSCALE>"
+
+
+def test_black_dimensions_keep_their_line_format_and_do_not_restyle_hidden_marks():
+    driven = SimpleNamespace(Visible=1, Color=0x808080, Width=1, Style=0)
+    imported = SimpleNamespace(Visible=1, Color=0, Width=0, Style=0)
+    hidden = SimpleNamespace(Visible=3, Color=0x808080)
+    displays = tuple(SimpleNamespace(GetAnnotation=annotation) for annotation in (driven, imported, hidden))
+    view = SimpleNamespace(GetDisplayDimensions=displays)
+    redraws = []
+    doc = SimpleNamespace(GetViews=((None, view),), GraphicsRedraw2=lambda: redraws.append(True))
+
+    annotation_layout.set_black_dimension_color(doc)
+
+    assert driven.Color == imported.Color == 0
+    assert (driven.Width, imported.Width, driven.Style, imported.Style) == (1, 0, 0, 0)
+    assert hidden.Color == 0x808080
+    assert redraws == [True]
+
+
+def test_diameter_detects_stray_branch_but_accepts_outside_arrows_on_opposite_sides():
+    left, right = (.094, .10), (.106, .10)
+    tips = (left, right)
+    item = SimpleNamespace(kind=6, annotation=SimpleNamespace(GetDisplayData=SimpleNamespace(
+        GetArrowHeadCount=2, GetArrowHeadAtIndex2=tips.__getitem__)))
+    strokes = [(left, right), (right, (.12, .10)), ((.12, .10), (.135, .10))]
+    assert not annotation_layout._doubled_diameter_leader(item, [*strokes, (left, (.089, .10))])
+    assert annotation_layout._doubled_diameter_leader(
+        item, [*strokes, ((.10597, .1006), (.135, .1006))])
+
+
 def test_dimension_routes_avoid_other_text_and_neighboring_views():
     label = (.02, .02, .04, .03)
     crossing = ((0., .025), (.05, .025))
@@ -93,6 +140,9 @@ def test_dimension_routes_avoid_other_text_and_neighboring_views():
     assert not _routes_fit(label, (), (), [((.05, .03, .06, .04), (crossing,))])
     assert not _routes_fit(label, (((.04, .015), (.08, .015)),), [neighbor], [])
     assert _routes_fit(label, (outside,), [neighbor], [])
+    near_text = ((0., .0305), (.05, .0305))
+    assert _routes_fit(label, (), (), [(neighbor, (near_text,))])
+    assert not _routes_fit(label, (), (), [(neighbor, (near_text,))], text_clearance=.002)
 
 
 def linear_annotation(start, end, lane, axis=0):
