@@ -11,6 +11,19 @@ from tkinter import filedialog, messagebox, ttk
 from gostinator.cli import run_batch
 
 
+DIRECTORY_EDITS = {
+    ord("X"): ("Вырезать", "<<Cut>>"),
+    ord("C"): ("Копировать", "<<Copy>>"),
+    ord("V"): ("Вставить", "<<Paste>>"),
+    ord("A"): ("Выделить всё", "<<SelectAll>>"),
+}
+
+
+def path_text(variable):
+    # Explorer's "Copy as path" includes double quotes.
+    return variable.get().strip().strip('"')
+
+
 class LogStream:
     encoding = "utf-8"
 
@@ -34,7 +47,6 @@ class GostinatorWindow:
         self.status = tk.StringVar(value="Готово к запуску")
         self.parts = tk.StringVar(value=str(Path.cwd() / "in"))
         self.output = tk.StringVar(value=str(Path.cwd() / "out"))
-        self.controls = []
 
         root.title("Gostinator")
         root.minsize(610, 480)
@@ -65,9 +77,8 @@ class GostinatorWindow:
 
         actions = ttk.Frame(content)
         actions.grid(row=3, sticky="ew", pady=(1, 12))
-        run_button = ttk.Button(actions, text="Создать чертежи", style="Run.TButton", command=self.start)
-        run_button.pack(side="left")
-        self.controls.append(run_button)
+        self.run_button = ttk.Button(actions, text="Создать чертежи", style="Run.TButton", command=self.start)
+        self.run_button.pack(side="left")
 
         self.progress = ttk.Progressbar(content, mode="determinate", maximum=1)
         self.progress.grid(row=4, sticky="ew")
@@ -92,8 +103,34 @@ class GostinatorWindow:
         entry = ttk.Entry(frame, textvariable=variable)
         entry.grid(row=1, column=0, sticky="ew")
 
+        menu = tk.Menu(entry, tearoff=False)
+        for key, (label, action) in DIRECTORY_EDITS.items():
+            menu.add_command(label=label, accelerator=f"Ctrl+{chr(key)}",
+                             command=lambda action=action: entry.event_generate(action))
+
+        def show_edit_menu(event):
+            entry.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        def edit_shortcut(event):
+            # Tk versions differ in resolving Ctrl shortcuts on non-Latin
+            # layouts. Windows virtual key codes keep these letters stable.
+            if event.state & 0x20010:  # Alt or AltGr
+                return None
+            edit = DIRECTORY_EDITS.get(event.keycode)
+            if edit:
+                entry.event_generate(edit[1])
+                return "break"
+            return None
+
+        entry.bind("<<ContextMenu>>", show_edit_menu)
+        entry.bind("<Control-KeyPress>", edit_shortcut)
+
         def browse():
-            current = Path(variable.get()).expanduser()
+            current = Path(path_text(variable)).expanduser()
             initial = current if current.is_dir() else current.parent
             selected = filedialog.askdirectory(parent=self.root, title=caption, initialdir=initial)
             if selected:
@@ -101,12 +138,11 @@ class GostinatorWindow:
 
         button = ttk.Button(frame, text="Обзор…", command=browse)
         button.grid(row=1, column=1, padx=(8, 0))
-        self.controls.extend((entry, button))
 
     def start(self):
         if self.running:
             return
-        parts, output = self.parts.get().strip(), self.output.get().strip()
+        parts, output = path_text(self.parts), path_text(self.output)
         if not parts or not output:
             messagebox.showerror("Gostinator", "Укажите обе папки.", parent=self.root)
             return
@@ -116,8 +152,7 @@ class GostinatorWindow:
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
-        for control in self.controls:
-            control.state(["disabled"])
+        self.run_button.state(["disabled"])
         Thread(target=self.convert, args=(Path(parts), Path(output))).start()
 
     def convert(self, parts, output):
@@ -150,8 +185,7 @@ class GostinatorWindow:
                 self.status.set(f"Обработано {completed} из {total}")
             elif event == "done":
                 self.running = False
-                for control in self.controls:
-                    control.state(["!disabled"])
+                self.run_button.state(["!disabled"])
                 self.status.set("Готово" if payload == 0 else "Есть ошибки. Подробности в журнале.")
         self.root.after(60, self.poll)
 

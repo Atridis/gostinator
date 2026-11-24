@@ -91,10 +91,7 @@ def _create_section(doc, front, model, axis, section, destination, scale, *, fir
         null_object = VARIANT(VT_DISPATCH, None)
         if not get_value(segment, "Select4", False, null_object):
             return None
-        if get_value(doc, "MakeSectionLine") is False:
-            return None
-        if not get_value(segment, "Select4", False, null_object):
-            return None
+        # CreateSectionViewAt5 promotes the selected sketch segment itself.
         # A drawing of a part has no excluded components.
         # Orient a horizontal cut to face the first-angle placement. For a
         # single central through bore, either section direction cuts the

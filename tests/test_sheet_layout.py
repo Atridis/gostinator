@@ -1,11 +1,14 @@
-from math import pi
+from math import cos, pi, sin
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from gostinator import annotation_layout
 from gostinator.annotation_layout import (
-    _fits_detail, _polyline_strokes, _routes_fit, candidates, crosses, fits, format_zones, text_extent,
+    _align_chains, _callout_crowding, _callout_positions, _center_linear_labels, _distance_to_stroke,
+    _fits_detail, _linear_span, _polyline_strokes, _radius_arc, _routes_fit, _span_overhang, _try_chain,
+    candidates, crosses, dimension_lines, fits, format_zones, section_line_zones, text_extent, text_geometry,
 )
 from gostinator.drawing_views import Frame
 from gostinator.title_block import _linked_notes, form_cells
@@ -92,6 +95,132 @@ def test_dimension_routes_avoid_other_text_and_neighboring_views():
     assert _routes_fit(label, (outside,), [neighbor], [])
 
 
+def linear_annotation(start, end, lane, axis=0):
+    def xy(along, across):
+        return (along, across, 0.) if axis == 0 else (across, along, 0.)
+
+    position = xy((start+end)/2-.0025, lane)
+
+    def move(*target):
+        nonlocal position
+        position = target
+        return True
+
+    display = SimpleNamespace(
+        GetArrowHeadCount=2,
+        GetArrowHeadAtIndex2=lambda index: (*xy((start, end)[index], position[1-axis]),
+                                            *xy(1. if index == 0 else -1., 0.)),
+        GetTextCount=1, GetTextAtIndex=lambda _: "10", GetTextInBoxWidthAtIndex=lambda _: .005,
+        GetTextAngleAtIndex=lambda _: axis*pi/2, GetTextPositionAtIndex=lambda _: position,
+        GetTextHeightAtIndex=lambda _: .0035, GetLineCount=1,
+        GetLineAtIndex=lambda _: (0., *xy(start, position[1-axis]), *xy(end, position[1-axis])),
+    )
+    return SimpleNamespace(kind=2, annotation=SimpleNamespace(
+        GetDisplayData=display, GetPosition=lambda: position, SetPosition2=move))
+
+
+@pytest.mark.parametrize("axis", (0, 1))
+def test_adjacent_linear_dimensions_share_a_row_without_changing_their_spans(axis):
+    items = [linear_annotation(start, end, lane, axis) for start, end, lane in (
+        (.07, .08, .075), (.08, .092, .085), (.092, .102, .066),
+        (.11, .12, .075),  # Same direction and nominal, with no common witness line.
+        (.07, .102, .060),  # Overall dimension spans the chain.
+    )]
+    occupied = [(text_geometry(item.annotation)[0], dimension_lines(item.annotation)) for item in items]
+    before = [_linear_span(item) for item in items]
+    assert _align_chains([(item, "view", span) for item, span in zip(items, before)], occupied,
+                         {"view": (.1, .1, .2, .2)}, (), (.02, .02, .3, .3)) == 2
+    after = [_linear_span(item) for item in items]
+    assert [span.baseline for span in after] == pytest.approx([.085, .085, .085, .075, .060])
+    assert [(s.axis, s.start, s.end) for s in after] == [(s.axis, s.start, s.end) for s in before]
+
+
+def test_chain_rolls_back_if_a_label_hits_another_dimension():
+    items = [linear_annotation(.06, .08, .075), linear_annotation(.08, .10, .085)]
+    before = [_linear_span(item) for item in items]
+    occupied = [((.086, .084, .094, .090), ())]
+    assert _try_chain(list(zip(items, before)), .085, (.02, .02, .3, .3),
+                      (.10, .1, .2, .2), (), occupied) is None
+    assert [_linear_span(item) for item in items] == before
+
+
+@pytest.mark.parametrize("axis,side", ((0, -1), (1, 1)))
+def test_enclosing_dimension_moves_outside_the_smaller_chain(axis, side):
+    near, inverted = ((.105, .109) if side == -1 else (.195, .191))
+    items = [linear_annotation(start, end, lane, axis) for start, end, lane in (
+        (.125, .157, near), (.157, .169, near), (.125, .169, inverted),
+    )]
+    before = [_linear_span(item) for item in items]
+    occupied = [(text_geometry(item.annotation)[0], dimension_lines(item.annotation)) for item in items]
+    assert _align_chains([(item, "view", span) for item, span in zip(items, before)], occupied,
+                         {"view": (.12, .12, .18, .18)}, (), (.02, .02, .3, .3)) == 1
+    after = [_linear_span(item) for item in items]
+    assert after[:2] == before[:2]
+    assert after[2].baseline == pytest.approx(near + side*.006)
+    assert (after[2].start, after[2].end) == (before[2].start, before[2].end)
+
+
+def test_chain_placement_follows_ordinary_label_relocation(monkeypatch):
+    view = SimpleNamespace(GetName2="main", GetOutline=(.06, .12, .15, .19), Type=7)
+    item = linear_annotation(.08, .10, .15)
+    item.view, item.dimension = view, None
+    document = SimpleNamespace(ViewZoomtofit2=lambda: None, GetCurrentSheet=SimpleNamespace())
+    monkeypatch.setattr(annotation_layout, "drawing_views", lambda _: [view])
+    monkeypatch.setattr(annotation_layout, "visible_dimensions", lambda _: [item])
+    assert annotation_layout.arrange_dimensions(document, Frame(.210, .297, True)) == (1, 1, 0)
+
+
+@pytest.mark.parametrize("length,moved", ((.020, 1), (.007, 0)))
+def test_linear_text_returns_inside_only_when_it_fits(length, moved):
+    item = linear_annotation(.06, .06+length, .085)
+    ann = item.annotation
+    ann.SetPosition2(.12, .085, 0.)
+    data = ann.GetDisplayData
+    first = data.GetLineAtIndex(0)
+    data.GetLineCount = 2
+    data.GetLineAtIndex = lambda index: first if index == 0 else (
+        0., .06+length, .085, 0., *ann.GetPosition())
+    span = _linear_span(item)
+    # An in-span endpoint of the second segment leaves no external tail.
+    placed = [(item, 'view', span)]
+    occupied = [(text_geometry(ann)[0], dimension_lines(ann))]
+    assert _center_linear_labels(placed, occupied, {'view': (.04, .10, .15, .18)}, {}, (),
+                                 (.02, .02, .20, .25)) == moved
+    if moved:
+        label, lines = occupied[0]
+        assert span.start < label[0] < label[2] < span.end
+        assert _span_overhang(span, lines) == 0.
+    else:
+        assert ann.GetPosition()[0] == .12
+
+
+def test_callouts_try_quieter_areas_around_the_view_with_reserved_space():
+    view = (.055, .09, .155, .17)
+    box = (.163, .095, .178, .100)
+    used = ((.162, .1015, .176, .106), (.163, .108, .173, .112))
+    reserved = ((.03, .17, .19, .23),)
+    allowed = (.02, .05, .195, .23)
+    score, nearby = _callout_crowding(box, used)
+    assert nearby == 2
+    options = _callout_positions(box, view, allowed, reserved, used, score)
+    assert options
+    for _, dx, dy in options:
+        translated = (box[0]+dx, box[1]+dy, box[2]+dx, box[3]+dy)
+        assert fits(translated, allowed, (view, *reserved), used)
+        assert _callout_crowding(translated, used)[0] < score
+
+
+def test_radius_move_keeps_the_arrow_on_the_visible_arc():
+    points = [(cos(i*pi/8)*.010, sin(i*pi/8)*.010) for i in range(5)]
+    arc = tuple(zip(points, points[1:]))
+    tangent = (points[0], (.01, -.015))
+    arrow = (*points[2], 0., cos(pi/4), sin(pi/4), 0.)
+    visible, tolerance = _radius_arc(arrow, .010, (*arc, tangent))
+    assert visible == arc
+    assert any(_distance_to_stroke(points[1], edge) <= tolerance for edge in visible)
+    assert all(_distance_to_stroke((.01, -.003), edge) > tolerance for edge in visible)
+
+
 def test_gost_format_reserves_the_upper_left_designation_cell():
     sheet = SimpleNamespace(GetTemplateName="a2 - gost_sh1.slddrt")
     doc = SimpleNamespace(GetCurrentSheet=sheet)
@@ -101,6 +230,17 @@ def test_gost_format_reserves_the_upper_left_designation_cell():
     box = (.11, .405, .12, .41)
     assert not _routes_fit(box, (((.06, .405), (.11, .405)),), reserved, [])
     assert not fits((.04, .405, .055, .410), frame.drawable, reserved, ())
+
+
+def test_section_markers_are_reserved_in_sheet_coordinates():
+    line = SimpleNamespace(GetLabel="A", GetTextFormat=SimpleNamespace(CharHeight=.007),
+                           GetTextInfo=(.050, .228, 0., .169, .228, 0.),
+                           GetArrowInfo=(.058, .218, 0., .058, .229, 0., .167, .218, 0., .167, .229, 0.))
+    view = SimpleNamespace(GetSectionLines=(line,), GetXform=(.110, .229, 2.))
+    zones = tuple(section_line_zones(view))
+    assert len(zones) == 4
+    assert not fits((.049, .224, .055, .232), (.020, .060, .205, .292), zones, ())
+    assert not _routes_fit((.045, .240, .050, .245), (((.05, .224), (.065, .224)),), zones, ())
 
 
 @pytest.mark.parametrize("width", (.210, .594))
