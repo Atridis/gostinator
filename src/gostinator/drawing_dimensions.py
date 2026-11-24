@@ -1,7 +1,7 @@
 """Select and dimension visible model geometry on the native drawing."""
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
-from math import acos, dist, isclose, tau
+from math import acos, dist, isclose, isfinite, sqrt, tau
 from re import fullmatch
 
 from pythoncom import VT_DISPATCH, com_error
@@ -9,7 +9,9 @@ from win32com.client import VARIANT
 
 from .annotation_layout import geometry_outline, view_strokes, visible_dimensions
 from .drawing_views import drawing_views, project, transform_of
-from .model_geometry import Bore, POSITION_TOLERANCE as TOLERANCE, axis_of, choose_section, primary_axis
+from .model_geometry import (
+    Bore, POSITION_TOLERANCE as TOLERANCE, axis_of, choose_section, perpendicular_flange_profile, primary_axis,
+)
 from .solidworks import as_dispatch, get_value
 
 
@@ -18,6 +20,10 @@ ANGLE = 3
 RADIUS = 5
 DIAMETER = 6
 VISIBLE, HIDDEN = 1, 3
+SW_ARC_END_FARTHEST = 3
+SW_DIMENSION_TEXT_PREFIX = 1
+SW_END_BLIND = 0
+SW_END_MIDPLANE = 6
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,8 @@ class Task:
     overall: bool = False
     bore: Bore | None = None
     profile: bool = False
+    arc_ends: int = 0
+    position: tuple[float, float] | None = None
 
 
 def _optional(obj, name, *args):
@@ -180,6 +188,31 @@ def _folded_profile_shift(vertices, model, normal, position):
     return matches[0] if len(matches) == 1 else None
 
 
+def _registered_vertices(vertices, lines, matrix, shift):
+    def register(anchor):
+        point = tuple(value - delta for value, delta in zip(anchor.model, shift))
+        return replace(anchor, model=point, sheet=project(point, matrix))
+
+    return ([register(vertex) for vertex in vertices],
+            [replace(line, ends=tuple(map(register, line.ends))) for line in lines])
+
+
+def _arc_vertex_shift(vertices, circles, position):
+    # Drawing vertices can include the view position while the corresponding
+    # curve parameters are returned in model coordinates.
+    if not position or dist(position[:2], (0., 0.)) <= TOLERANCE:
+        return None
+    ends = {_point_key(point) for circle in circles for point in circle.ends if point}
+    if len(ends) < 2:
+        return None
+    shifts = ((0., 0., 0.), (*position[:2], 0.))
+    scores = [len(ends & {_point_key(tuple(a-b for a, b in zip(v.model, shift))) for v in vertices})
+              for shift in shifts]
+    if scores[1] >= 2 and scores[0] == 0:
+        return shifts[1]
+    return shifts[0] if scores[0] >= 2 and scores[1] == 0 else None
+
+
 def _physical_profile_key(task, matrix, shift):
     axis = axis_of(matrix[task.direction:9:3])
     if axis is None:
@@ -194,20 +227,92 @@ def _profile_interval(profile):
     return axis, tuple(sorted(point[axis] for point in ends))
 
 
+def _cut_depth(view, dimension, name):
+    """Return the value only for a verified depth of an extruded cut."""
+    if not isinstance(name, str) or not name.casefold().endswith(".part"):
+        return None
+    owner = _optional(dimension, "GetFeatureOwner")
+    if owner is None:
+        components = name.split("@", 2)
+        source = _optional(view, "ReferencedDocument")
+        if len(components) == 3 and source is not None:
+            owner = _optional(source, "FeatureByName", components[1])
+    if owner is None:
+        return None
+    kind = _optional(owner, "GetTypeName2")
+    if kind == "ICE":
+        kind = _optional(owner, "GetTypeName")
+    if kind not in ("Cut", "CutThin"):
+        return None
+    definition = _optional(owner, "GetDefinition")
+    value = _optional(dimension, "GetSystemValue2", "")
+    if definition is None or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0.:
+        return None
+    directions = (True, False) if _optional(definition, "BothDirections") else (True,)
+    for forward in directions:
+        if _optional(definition, "GetEndCondition", forward) not in (SW_END_BLIND, SW_END_MIDPLANE):
+            continue
+        depth = _optional(definition, "GetDepth", forward)
+        if isinstance(depth, (int, float)) and isclose(value, depth, abs_tol=TOLERANCE, rel_tol=0.):
+            return value
+    return None
+
+
+def _depth_extends_past_material(tips, strokes, nominal, scale):
+    if len(tips) != 2 or not strokes or not all(
+            tip and len(tip) >= 2 and all(map(isfinite, tip[:2])) for tip in tips):
+        return False
+    start, end = (tip[:2] for tip in tips)
+    measured = dist(start, end)
+    clearance = max(.0001, 4*TOLERANCE*scale)
+    if measured <= clearance or not isclose(measured, nominal*scale, abs_tol=clearance, rel_tol=0.):
+        return False
+    axis = tuple((b-a)/measured for a, b in zip(start, end))
+
+    def station(point):
+        return sum(x*y for x, y in zip(point, axis))
+
+    stations = [station(point) for stroke in strokes for point in stroke]
+    low, high = min(stations)-clearance, max(stations)+clearance
+    # Require one real material-side datum and one end beyond the displayed
+    # part envelope. An incomplete projection cannot establish the depth.
+    return (low <= station(start) <= high) != (low <= station(end) <= high)
+
+
 def prune_model_dimensions(doc):
-    """Keep one display of each model dimension and hide dangling marks."""
+    """Hide duplicates, dangling marks and cut lengths extending past stock."""
     names = set()
     removed = 0
+    zoomed = False
     for view in drawing_views(doc):
+        strokes = None
         for display in _optional(view, "GetDisplayDimensions") or ():
             annotation = _optional(display, "GetAnnotation")
             if annotation is None or _optional(annotation, "Visible") != VISIBLE:
                 continue
             dimension = _optional(display, "GetDimension2", 0)
             name = _optional(dimension, "FullName") if dimension is not None else None
-            if _optional(annotation, "IsDangling") or (name and name in names):
+            dangling = _optional(annotation, "IsDangling")
+            if dangling or (name and name in names):
                 removed += _hide(annotation)
-            elif name:
+                continue
+            if dimension is not None and _optional(display, "Type2") in (LINEAR, 11, 12):
+                nominal = _cut_depth(view, dimension, name)
+                if nominal is not None:
+                    if not zoomed:
+                        get_value(doc, "ViewZoomtofit2")
+                        zoomed = True
+                    data = _optional(annotation, "GetDisplayData")
+                    if data is not None and _optional(data, "GetArrowHeadCount") == 2:
+                        tips = [_optional(data, "GetArrowHeadAtIndex2", i) for i in range(2)]
+                        if strokes is None:
+                            box = get_value(view, "GetOutline")[:4]
+                            strokes = view_strokes(view, box)
+                        scale = _optional(view, "ScaleDecimal")
+                        if scale and _depth_extends_past_material(tips, strokes, nominal, scale) and _hide(annotation):
+                            removed += 1
+                            continue
+            if name:
                 names.add(name)
     return removed
 
@@ -334,19 +439,60 @@ def _overall_tasks(vertices, matrix, *, minimum=.003):
         yield Task((a, b), LINEAR, (high - low) / scale, direction, projected=True, overall=True)
 
 
-def _blank_extent_tasks(vertices, matrix, contour):
+def _blank_extent_tasks(vertices, matrix, contour, circles=(), lines=()):
     if contour is None:
         return
+    done = set()
     for task in _overall_tasks(vertices, matrix, minimum=TOLERANCE):
         direction = task.direction
         span = (contour[direction+2] - contour[direction]) / matrix[12]
         # SolidWorks' drawing-view outline includes a margin. Compare the
         # selected endpoints with the actual displayed blank contour instead.
         if isclose(task.nominal, span, abs_tol=2*TOLERANCE, rel_tol=0.):
-            yield replace(task, projected=True)
+            done.add(direction)
+            rails = _parallel_blank_sides(lines, contour, direction, matrix[12])
+            yield replace(task, targets=rails or task.targets, projected=True)
+    normal = axis_of(matrix[2:9:3])
+    arcs = [circle for circle in circles if circle.axis == normal and .20 <= circle.fraction <= .55]
+    for direction in (0, 1):
+        if direction in done or not arcs:
+            continue
+        scale = matrix[12]
+        point_ends = [(a.sheet[direction], a, 0) for a in vertices]
+        near = point_ends + [(c.anchor.sheet[direction]-c.radius*scale, c.anchor, 1) for c in arcs]
+        far = point_ends + [(c.anchor.sheet[direction]+c.radius*scale, c.anchor, 1) for c in arcs]
+        low, a, first_arc = min(near, key=lambda item: item[0])
+        high, b, second_arc = max(far, key=lambda item: item[0])
+        measured = (high-low) / scale
+        span = (contour[direction+2] - contour[direction]) / scale
+        if a is not b and isclose(measured, span, abs_tol=2*TOLERANCE, rel_tol=0.):
+            yield Task((a, b), LINEAR, measured, direction, projected=True, overall=True,
+                       arc_ends=first_arc+second_arc)
 
 
-def _hole_tasks(circles, lines, model, view_axis, matrix):
+def _parallel_blank_sides(lines, contour, direction, scale):
+    # Opposite tangency points on a round-ended blank can trigger a
+    # diameter display. Prefer the two parallel sides when they exist.
+    tolerance = max(TOLERANCE*scale, 1e-6)
+    along = 1-direction
+    rails = []
+    for side in (contour[direction], contour[direction+2]):
+        candidates = [line for line in lines if all(abs(a.sheet[direction]-side) < tolerance for a in line.ends)
+                      and abs(line.ends[0].sheet[along]-line.ends[1].sheet[along]) > .004*scale]
+        if not candidates:
+            return ()
+        rails.append(candidates)
+    pairs = [(a, b) for a in rails[0] for b in rails[1]
+             if all(abs(first.sheet[2]-second.sheet[2]) <= tolerance
+                    for first in a.ends for second in b.ends)]
+    if not pairs:
+        return ()
+    selected = max(pairs, key=lambda pair: sum(dist(*(p.sheet for p in line.ends)) for line in pair))
+    return tuple(Anchor(line.entity, line.ends[0].model,
+                        tuple((a+b)/2 for a, b in zip(*(p.sheet for p in line.ends)))) for line in selected)
+
+
+def _hole_tasks(circles, lines, model, view_axis, matrix, *, cap=None, vertices=()):
     matched = defaultdict(dict)
     for circle in circles:
         if circle.axis != view_axis:
@@ -385,7 +531,10 @@ def _hole_tasks(circles, lines, model, view_axis, matrix):
                 width = abs(a.sheet[direction] - b.sheet[direction]) / matrix[12]
                 if abs(a.sheet[transverse] - b.sheet[transverse]) > tolerance and width >= .003:
                     yield Task((a, b), LINEAR, width, direction, projected=True)
-            datum = _datum_offset(members, lines, direction, matrix)
+            if cap is not None:
+                datum = _rounded_flange_datum(members, vertices, cap, direction, matrix)
+            else:
+                datum = _datum_offset(members, lines, direction, matrix)
             if datum:
                 yield datum
 
@@ -414,6 +563,49 @@ def _datum_offset(members, lines, direction, matrix):
                 datum = Anchor(line.entity, a.model, midpoint)
                 choices.append((offset, Task((center, datum), LINEAR, offset, direction, projected=True)))
     return min(choices, key=lambda pair: pair[0])[1] if choices else None
+
+
+def _rounded_end(circles, normal, contour, scale):
+    # A rounded flange end can be split into two quarter arcs. Its centre is
+    # one radius in from just one end of the visible stock envelope.
+    if contour is None:
+        return None
+    groups = defaultdict(list)
+    for circle in circles:
+        if circle.axis == normal and .20 <= circle.fraction <= .54:
+            groups[(_point_key(circle.anchor.model), round(circle.radius/TOLERANCE))].append(circle)
+    for group in groups.values():
+        circle = group[0]
+        radius = circle.radius * scale
+        x, y = circle.anchor.sheet[:2]
+        for direction, center in enumerate((x, y)):
+            along = 1-direction
+            if not isclose(contour[along+2]-contour[along], 2*radius, abs_tol=4*TOLERANCE):
+                continue
+            if not isclose((x, y)[along], (contour[along]+contour[along+2])/2, abs_tol=4*TOLERANCE):
+                continue
+            for side, sign in ((0, -1), (2, 1)):
+                if isclose(center+sign*radius, contour[direction+side], abs_tol=4*TOLERANCE):
+                    # Validate that the half-round actually reaches this end.
+                    ends = [point for arc in group for point in arc.ends if point]
+                    if len({_point_key(point) for point in ends}) >= 3 or any(
+                            .44 <= arc.fraction <= .54 for arc in group):
+                        return circle, direction, sign
+    return None
+
+
+def _rounded_flange_datum(members, vertices, cap, direction, matrix):
+    _, along, sign = cap
+    if direction != along or not vertices:
+        return None
+    center = min((c.anchor for c in members), key=lambda a: sign*a.sheet[direction])
+    limit = min(sign*v.sheet[direction] for v in vertices)
+    edge = min((v for v in vertices if abs(sign*v.sheet[direction]-limit) <= TOLERANCE),
+               key=lambda v: (abs(v.sheet[2]-center.sheet[2]), abs(v.sheet[1-direction]-center.sheet[1])))
+    nominal = abs(edge.sheet[direction]-center.sheet[direction])/matrix[12]
+    if nominal >= .003:
+        return Task((center, edge), LINEAR, nominal, direction, projected=True)
+    return None
 
 
 def _profile_tasks(lines, matrix):
@@ -456,8 +648,13 @@ def _profile_radii(circles, lines, vertices, normal, matrix):
 
 
 def _tangent_ends(circle, lines):
+    return bool(_tangent_rails(circle, lines))
+
+
+def _tangent_rails(circle, lines):
     if len(circle.ends) != 2 or not all(point and len(point) == 3 for point in circle.ends):
-        return False
+        return ()
+    rails = []
     for point in circle.ends:
         radial = tuple(a - b for a, b in zip(point, circle.anchor.model))
         tangents = []
@@ -469,8 +666,77 @@ def _tangent_ends(circle, lines):
             if cross <= .025 * dist(a, b) * circle.radius:
                 tangents.append(line)
         if not tangents:
-            return False
-    return True
+            return ()
+        rails.append(max(tangents, key=lambda line: dist(*(a.model for a in line.ends))))
+    return tuple(rails)
+
+
+def _bend_profile_tasks(circles, lines, normal):
+    groups = defaultdict(list)
+    for circle in circles:
+        if circle.axis == normal and .22 <= circle.fraction <= .28:
+            groups[_point_key(circle.anchor.model)].append(circle)
+    for group in groups.values():
+        inner = min(group, key=lambda circle: circle.radius)
+        if max(circle.radius for circle in group) - inner.radius <= TOLERANCE:
+            continue
+        rails = _tangent_rails(inner, lines)
+        if len(rails) != 2:
+            continue
+        directions = [tuple(b-a for a, b in zip(*(point.model for point in line.ends))) for line in rails]
+        lengths = [dist((0., 0., 0.), delta) for delta in directions]
+        cosine = abs(sum(a*b for a, b in zip(*directions))) / (lengths[0] * lengths[1])
+        if cosine > .05 or min(lengths) < inner.radius:
+            continue
+        anchors = tuple(Anchor(line.entity, line.ends[0].model,
+                               tuple((a+b)/2 for a, b in zip(*(point.sheet for point in line.ends))))
+                        for line in rails)
+        # Place the angle on the inside of the bend, between the two legs.
+        tangent_points = [min(line.ends, key=lambda a: dist(a.model, point)).sheet
+                          for line, point in zip(rails, inner.ends)]
+        corner = tuple(a+b-c for a, b, c in zip(*tangent_points, inner.anchor.sheet))
+        rays = [max(line.ends, key=lambda a: dist(a.sheet, corner)).sheet for line in rails]
+        unit = [tuple((b-a)/dist(point, corner) for a, b in zip(corner, point)) for point in rays]
+        reach = min(.026, .85*min(dist(point, corner) for point in rays)) / sqrt(2)
+        position = tuple(corner[i]+reach*(unit[0][i]+unit[1][i]) for i in (0, 1))
+        yield Task((inner.anchor,), RADIUS, inner.radius, 0)
+        yield Task(anchors, ANGLE, acos(cosine), 0, position=position)
+
+
+def _folded_flange_tasks(vertices, circles, lines, model, normal, matrix, contour, profile_axis):
+    if contour is None:
+        return ()
+    extents = list(_blank_extent_tasks(vertices, matrix, contour, circles))
+    if normal == profile_axis:
+        bend = list(_bend_profile_tasks(circles, lines, normal))
+        if not bend:
+            return [*extents, *_profile_tasks(lines, matrix),
+                    *_profile_radii(circles, lines, vertices, normal, matrix)]
+        # A bend's concentric arcs give the stock thickness. Dimension it
+        # once on a straight flange, using the actual boundary vertices.
+        for radius in (task for task in bend if task.kind == RADIUS):
+            center = radius.targets[0].model
+            thickness = max(c.radius for c in circles if c.axis == normal and dist(c.anchor.model, center) <= TOLERANCE)
+            thickness -= radius.nominal
+            candidates = [task for task in _profile_tasks(lines, matrix)
+                          if abs(task.nominal-thickness) <= TOLERANCE]
+            if candidates:
+                bend.append(max(candidates, key=lambda task: task.direction))
+                break
+        return [*extents, *bend]
+    cap = _rounded_end(circles, normal, contour, matrix[12])
+    holes = list(_hole_tasks(circles, lines, model, normal, matrix, cap=cap, vertices=vertices))
+    if cap is None:
+        return [*extents, *holes, *_profile_radii(circles, lines, vertices, normal, matrix)]
+    circle, along, _ = cap
+    # The bend profile owns the leg lengths. Keep the width on the face
+    # that also owns the hole row when both projections show the same stock.
+    transverse = axis_of(matrix[1-along:9:3])
+    counts = Counter(bore.axis for bore in model.bores)
+    preferred = max((i for i in range(3) if i != profile_axis), key=lambda i: (counts[i], -i))
+    show_width = transverse != profile_axis or normal == preferred
+    return [*(task for task in extents if show_width and task.direction != along),
+            Task((circle.anchor,), RADIUS, circle.radius, 0), *holes]
 
 
 def _corner_cut_tasks(lines, matrix):
@@ -787,10 +1053,127 @@ def _section_walls(lines, bore, center, half_width, direction, tolerance):
     return None
 
 
-def _label(task, own, boxes, text, frame):
+def _through_section_openings(boxes, axis, along):
+    ordered = sorted(boxes, key=lambda box: box[along])
+    for left, right in zip(ordered, ordered[1:]):
+        start, end = left[along+3], right[along]
+        if end - start <= 2*TOLERANCE:
+            continue
+        if any(box[along] < end-TOLERANCE and box[along+3] > start+TOLERANCE
+               for box in ordered):
+            continue
+        low, high = left[axis], left[axis+3]
+        if max(abs(low-right[axis]), abs(high-right[axis+3])) <= 2*TOLERANCE:
+            yield (start+end)/2, low, high
+
+
+def _closed_inner_contours(strokes, bounds):
+    resolution = .0001  # sheet coordinates, including tessellated arcs
+    neighbors = defaultdict(set)
+    for line in strokes:
+        a, b = (tuple(round(value / resolution) for value in p) for p in line)
+        if a != b:
+            neighbors[a].add(b)
+            neighbors[b].add(a)
+    remaining = set(neighbors)
+    while remaining:
+        stack = [remaining.pop()]
+        component = set(stack)
+        while stack:
+            for point in neighbors[stack.pop()] - component:
+                component.add(point)
+                remaining.remove(point)
+                stack.append(point)
+        if not all(len(neighbors[p]) == 2 for p in component):
+            continue
+        if not all(bounds[i] + resolution < point[i]*resolution < bounds[i+2] - resolution
+                   for point in component for i in (0, 1)):
+            continue
+        yield tuple((tuple(v*resolution for v in a), tuple(v*resolution for v in b))
+                    for a in component for b in neighbors[a] if a < b)
+
+
+def _inside_contour(point, contour):
+    x, y = point[:2]
+    crossings = sum((ay > y) != (by > y) and ax+(bx-ax)*(y-ay)/(by-ay) > x
+                    for (ax, ay), (bx, by) in contour)
+    return crossings % 2 == 1
+
+
+def _section_axis_lines(section, matrix, shift, hatch_boxes, base_matrix=None, contours=()):
+    axis = section.bores[0].axis
+    along = section.along
+    normal = next(i for i in range(3) if i not in (axis, along))
+    depth = max((0, 1), key=lambda i: abs(matrix[3*axis+i]))
+    if abs(matrix[3*axis+depth]) < .999:
+        return ()
+
+    def on_model(station, height):
+        point = [0., 0., 0.]
+        point[along], point[axis], point[normal] = station, height, section.coordinate
+        return point
+
+    def on_sheet(station, height):
+        return project(tuple(a+b for a, b in zip(on_model(station, height), shift)), matrix)
+
+    transverse = [i for i in range(3) if i != axis]
+    known = defaultdict(list)
+    for bore in section.bores:
+        known[_point_key(bore.point(0.))].append(bore)
+    extents = {}
+    for group in known.values():
+        station = group[0].center[transverse.index(along)]
+        extents[station] = (min(b.low for b in group), max(b.high for b in group))
+    for station, low, high in _through_section_openings(hatch_boxes, axis, along):
+        matches = [known_station for known_station in extents
+                   if abs(known_station-station) <= 2*TOLERANCE]
+        if matches:
+            extents[matches[0]] = (low, high)
+            continue
+        # A gap can also be an exterior notch. Only treat it as a slot
+        # when its centre is inside a closed internal contour of the parent.
+        if contours:
+            point = project(on_model(station, (low+high)/2), base_matrix)
+            if any(_inside_contour(point, contour) for contour in contours):
+                extents[station] = (low, high)
+
+    lines = []
+    extension = .002
+    for station, (low, high) in sorted(extents.items()):
+        points = sorted((on_sheet(station, low), on_sheet(station, high)), key=lambda p: p[depth])
+        a, b = [list(point[:2]) + [0.] for point in points]
+        a[depth] -= extension
+        b[depth] += extension
+        lines.append((tuple(a), tuple(b)))
+    return tuple(lines)
+
+
+def _cut_face_boxes(view, normal, coordinate):
+    for raw in _optional(view, "GetFaceHatches") or ():
+        face = _optional(as_dispatch(raw), "Face")
+        box = _optional(face, "GetBox") if face is not None else None
+        if box and len(box) == 6 and max(abs(box[i]-coordinate)
+                                         for i in (normal, normal+3)) <= 2*TOLERANCE:
+            yield box
+
+
+def _section_parent_contours(view):
+    base = _optional(view, "GetBaseView")
+    if base is None:
+        return None, ()
+    strokes = view_strokes(base, get_value(base, "GetOutline")[:4])
+    if not strokes:
+        return None, ()
+    return transform_of(base), tuple(_closed_inner_contours(strokes, geometry_outline(strokes, None)))
+
+
+def _label(task, own, boxes, text, frame, *, at=None):
     x0, y0, x1, y1 = own
-    x, y = (sum(a.sheet[i] for a in task.targets) / len(task.targets) for i in (0, 1))
+    x, y = at if at is not None else (
+        sum(a.sheet[i] for a in task.targets) / len(task.targets) for i in (0, 1))
     low_x, low_y, high_x, high_y = frame.drawable
+    if task.position is not None and low_x < task.position[0] < high_x and low_y < task.position[1] < high_y:
+        return task.position
     for offset in (.008, .014, .020, .026):
         if task.kind in (DIAMETER, RADIUS):
             positions = ((x1 + offset, y), (x0 - offset, y), (x, y1 + offset), (x, y0 - offset))
@@ -847,12 +1230,24 @@ def _create(doc, view, task, position, matrix):
         return None
     dimension = _optional(display, "GetDimension2", 0)
     annotation = _optional(display, "GetAnnotation")
+    if dimension is not None and task.arc_ends:
+        ends = [i for i in (1, 2) if _optional(dimension, "GetArcEndCondition", i) in (1, 2, 3)]
+        if len(ends) != task.arc_ends or any(_optional(dimension, "SetArcEndCondition", i, SW_ARC_END_FARTHEST) != 0
+                                           for i in ends):
+            _discard(doc, view, display, annotation)
+            return None
+        get_value(doc, "GraphicsRedraw2")
     value = _optional(dimension, "GetSystemValue2", "") if dimension is not None else None
     kind = _optional(display, "Type2")
     linked = _optional(annotation, "GetAttachedEntityCount3") if annotation is not None else None
     if (linked is not None and linked >= len(task.targets) and kind is not None
             and value is not None and _key(kind, value)[0] == task.kind
             and isclose(value, task.nominal, abs_tol=TOLERANCE, rel_tol=1e-5)):
+        if task.overall and _optional(view, "IsFlatPatternView"):
+            if _optional(display, "Diametric"):
+                display.Diametric = False
+            if _optional(display, "GetText", SW_DIMENSION_TEXT_PREFIX) in ("<MOD-DIAM>", "Ø", "⌀"):
+                get_value(display, "SetText", SW_DIMENSION_TEXT_PREFIX, "")
         return annotation
     _discard(doc, view, display, annotation)
     return None
@@ -927,9 +1322,11 @@ def _discard(doc, view, display, annotation):
     raise RuntimeError("Не удалось убрать размер без подтверждённой привязки")
 
 
-def add_dimensions(doc, model, frame):
+def add_dimensions(doc, model, frame, *, flat_model=None):
+    from .hole_annotations import _thread_centers, projected_holes
+
     if model is None:
-        return 0, []
+        return 0, [], [], []
     views = [(view, bool(_optional(view, "IsFlatPatternView"))) for view in drawing_views(doc)]
     views.sort(key=lambda item: item[1])
     if any(flat for _, flat in views):
@@ -942,6 +1339,9 @@ def add_dimensions(doc, model, frame):
     boxes = [tuple(get_value(view, "GetOutline")[:4]) for view, _ in views]
     added = 0
     cut_diameters = []
+    section_axes = []
+    hole_views = []
+    flange_profile = perpendicular_flange_profile(model)
     for (view, flat), box in zip(views, boxes):
         matrix = transform_of(view)
         normal = axis_of(matrix[2:9:3])
@@ -949,20 +1349,36 @@ def add_dimensions(doc, model, frame):
             continue
         vertices, circles, lines = _anchors(view, matrix)
         section = get_value(view, "Type") == 2
+        if not section:
+            threads = () if flat else _thread_centers(view)
+            holes = projected_holes(circles, flat_model if flat else model, matrix, threads)
+            if holes:
+                hole_views.append((view, holes, matrix, flat))
         view_scope = get_value(view, "GetName2") if section or flat else None
         imported = _existing(view)
         created_in_view = set()
         profile_shift = (_folded_profile_shift(vertices, model, normal, _optional(view, "Position"))
                          if model.sheet_metal and view_scope is None else None)
+        if flange_profile is not None or flat:
+            shift = _arc_vertex_shift(vertices, circles, _optional(view, "Position"))
+            if shift is None and not flat:
+                shift = profile_shift
+            if shift is not None:
+                vertices, lines = _registered_vertices(vertices, lines, matrix, shift)
+                profile_shift = None if flat else (0., 0., 0.)
         if section:
             matrix, shift = _section_frame(vertices, model, normal, matrix, box)
             def reproject(anchor):
                 return replace(anchor, sheet=project(anchor.model, matrix))
             vertices = [reproject(vertex) for vertex in vertices]
             lines = [replace(line, ends=tuple(map(reproject, line.ends))) for line in lines]
+        contour = geometry_outline(view_strokes(view, box), None) if flat or flange_profile is not None else None
         if flat:
-            contour = geometry_outline(view_strokes(view, box), None)
-            tasks = _blank_extent_tasks(vertices, matrix, contour)
+            tasks = _blank_extent_tasks(vertices, matrix, contour, circles,
+                                        lines if flange_profile is not None else ())
+        elif flange_profile is not None:
+            tasks = _folded_flange_tasks(vertices, circles, lines, model, normal, matrix, contour,
+                                         flange_profile)
         else:
             tasks = list(_overall_tasks(vertices, matrix))
             if section:
@@ -971,6 +1387,12 @@ def add_dimensions(doc, model, frame):
                 datums = _section_datums(lines, depth_direction, matrix[12])
                 cut_lines = lines + list(_section_silhouettes(view, matrix))
                 tasks.extend(_section_tasks(vertices, cut_lines, model, normal, matrix, shift, datums=datums))
+                plan = choose_section(model, model_axis)
+                if plan is not None and normal not in (model_axis, plan.along):
+                    hatches = tuple(_cut_face_boxes(view, normal, plan.coordinate))
+                    base_matrix, contours = _section_parent_contours(view) if hatches else (None, ())
+                    axes = _section_axis_lines(plan, matrix, shift, hatches, base_matrix, contours)
+                    section_axes.append((view, axes))
             else:
                 tasks.extend(_recess_tasks(lines, matrix))
                 tasks.extend(_stock_span_tasks(lines, matrix))
@@ -999,7 +1421,8 @@ def add_dimensions(doc, model, frame):
             profile = profiles.get(id(task))
             if profile is not None and _profile_interval(profile) in covered_profile_spans:
                 continue
-            position = _label(task, box, boxes, text, frame)
+            flat_center = ((box[0]+box[2])/2, (box[1]+box[3])/2) if flat and flange_profile is not None else None
+            position = _label(task, box, boxes, text, frame, at=flat_center)
             if position is None:
                 continue
             annotation = _create(doc, view, task, position, matrix)
@@ -1013,4 +1436,4 @@ def add_dimensions(doc, model, frame):
                     created_profiles.add(profile)
                 text.append(position)
         get_value(doc, "ClearSelection2", True)
-    return added, cut_diameters
+    return added, cut_diameters, section_axes, hole_views

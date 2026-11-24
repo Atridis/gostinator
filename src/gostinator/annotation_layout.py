@@ -1,6 +1,7 @@
 """Arrange dimension labels against native text and view geometry."""
 from collections import defaultdict, namedtuple
 from dataclasses import dataclass, replace
+from itertools import chain, islice
 from math import cos, dist, hypot, isclose, isfinite, sin
 from pathlib import Path
 from re import sub
@@ -17,6 +18,7 @@ CHAIN_TOLERANCE = .0001  # on the drawing sheet, in metres
 NESTED_CLEARANCE = .006
 INLINE_CLEARANCE = .0015
 CALLOUT_RADIUS = .014
+FLAT_PATTERN_CAPTION = "Развертка"
 
 
 @dataclass(frozen=True)
@@ -210,6 +212,63 @@ def crosses(segment, box):
     return True
 
 
+def _leader_hits(segment, obstacle, center, radius):
+    """Test crossings outside the circular edge to which the leader attaches."""
+    a, b = segment
+    c, d = obstacle
+    if any(max(a[i], b[i]) < min(c[i], d[i]) or max(c[i], d[i]) < min(a[i], b[i]) for i in (0, 1)):
+        return False
+    x, y = b[0]-a[0], b[1]-a[1]
+    u, v = d[0]-c[0], d[1]-c[1]
+    px, py = c[0]-a[0], c[1]-a[1]
+    det = x*v-y*u
+    if abs(det) < 1e-12:
+        if abs(px*y-py*x) > 1e-12:
+            return False
+        along = 0 if abs(x) >= abs(y) else 1
+        span = b[along]-a[along]
+        if abs(span) < 1e-6:
+            return False
+        low, high = sorted(( (c[along]-a[along])/span, (d[along]-a[along])/span ))
+        left, right = max(0., low), min(1., high)
+        return left <= right and any(
+            dist((a[0]+t*x, a[1]+t*y), center) > radius for t in (left, right))
+    t, s = (px*v-py*u)/det, (px*y-py*x)/det
+    return 0. <= t <= 1. and 0. <= s <= 1. and dist((a[0]+t*x, a[1]+t*y), center) > radius
+
+
+def _clear_leader(strokes, obstacles, center, radius):
+    return bool(strokes) and not any(
+        _leader_hits(line, edge, center, radius) for line in strokes for edge in obstacles)
+
+
+def _leader_positions(anchors, width, height, allowed, own, foreign, used, obstacles):
+    proposals = []
+    diagonal = .7071067812
+    directions = ((1., 0.), (-1., 0.), (0., 1.), (0., -1.), (diagonal, diagonal),
+                  (-diagonal, diagonal), (diagonal, -diagonal), (-diagonal, -diagonal))
+    for anchor, center, radius in anchors:
+        for reach in (.006, .010, .015, .021, .029, .040):
+            for dx, dy in directions:
+                tip = (center[0]+dx*radius, center[1]+dy*radius)
+                elbow = (tip[0]+dx*reach, tip[1]+dy*reach)
+                side = 1 if dx >= 0 else -1
+                x = elbow[0] + side*width/2
+                y = elbow[1]
+                box = (x-width/2, y-height/2, x+width/2, y+height/2)
+                if not fits(box, allowed, foreign, used):
+                    continue
+                if any(crosses(edge, box) for edge in obstacles):
+                    continue
+                if not _clear_leader(((tip, elbow),), obstacles, center, radius+.0004):
+                    continue
+                if any(crosses((tip, elbow), used_box) for used_box in used):
+                    continue
+                outside = not intersects(box, own)
+                proposals.append((outside, reach, anchor, (x, y), center, radius))
+    return sorted(proposals, key=lambda row: row[:2])
+
+
 def _fits_detail(box, allowed, other_boxes, used, own, model_strokes):
     if not fits(box, allowed, other_boxes, used):
         return False
@@ -322,6 +381,23 @@ def _place_caption(annotation, own, allowed, outlines, occupied):
             return placed
     optional(annotation, "SetPosition2", *position[:3])
     return box
+
+
+def _place_flat_caption(annotation, outline):
+    position = optional(annotation, "GetPosition")
+    if not position or len(position) < 3:
+        return None
+    x = (outline[0] + outline[2]) / 2
+    y = outline[3] + .007
+    if optional(annotation, "SetPosition2", x, y, position[2]) is False:
+        return None
+    box, _, _ = text_geometry(annotation)
+    if box is None:
+        return None
+    dx = x - (box[0] + box[2]) / 2
+    dy = outline[3] + .004 - box[1]
+    optional(annotation, "SetPosition2", x+dx, y+dy, position[2])
+    return text_geometry(annotation)[0]
 
 
 def candidates(anchor, box, view, kind, angle):
@@ -736,6 +812,14 @@ def arrange_dimensions(doc, frame):
             box = _place_caption(caption, outlines[name], frame.drawable, outlines.values(), reserved)
             if box is not None:
                 reserved.append(box)
+        if name in flat_views:
+            for raw in optional(view, "GetNotes") or ():
+                note = as_dispatch(raw)
+                if optional(note, "GetText") == FLAT_PATTERN_CAPTION:
+                    annotation = optional(note, "GetAnnotation")
+                    box = _place_flat_caption(annotation, outlines[name]) if annotation is not None else None
+                    if box is not None:
+                        reserved.append(box)
     occupied = []
     accepted = []
     seen = set()
@@ -814,3 +898,88 @@ def arrange_dimensions(doc, frame):
                            frame.drawable)
     moved += _spread_callouts(accepted, occupied, outlines, view_edges, reserved, frame.drawable)
     return len(occupied), moved, hidden
+
+
+class DimensionTextLayout:
+    """Place a longer label while keeping the existing dimensions in place."""
+
+    def __init__(self, doc, frame):
+        self.frame = frame.drawable
+        views = {get_value(view, "GetName2"): view for view in drawing_views(doc)}
+        self.boxes = {name: get_value(view, "GetOutline")[:4] for name, view in views.items()}
+        self.edges = {name: view_strokes(view, self.boxes[name]) for name, view in views.items()
+                      if get_value(view, "Type") != 2 and not optional(view, "IsFlatPatternView")}
+        self.reserved = list(format_zones(doc, frame))
+        self.reserved.extend(zone for view in views.values() for zone in section_line_zones(view))
+        for view in views.values():
+            for raw in optional(view, "GetNotes") or ():
+                note = as_dispatch(raw)
+                annotation = optional(note, "GetAnnotation")
+                if annotation is not None and (box := text_geometry(annotation)[0]) is not None:
+                    self.reserved.append(box)
+        self.occupied = {}
+        self.items = tuple(visible_dimensions(doc))
+        for item in self.items:
+            if (box := text_geometry(item.annotation)[0]) is not None:
+                self.occupied[self._key(item.view, item.annotation)] = box, dimension_lines(item.annotation)
+
+    @staticmethod
+    def _key(view, annotation):
+        return get_value(view, "GetName2"), get_value(annotation, "GetName")
+
+    def place(self, view, annotation, kind):
+        key = self._key(view, annotation)
+        name = key[0]
+        used = [row for entry, row in self.occupied.items() if entry != key]
+        foreign = (*self.reserved, *(box for other, box in self.boxes.items() if other != name))
+        own = self.boxes[name]
+        edges = self.edges.get(name, ())
+        origin = optional(annotation, "GetPosition")
+        box, angle, _ = text_geometry(annotation)
+        if not origin or box is None:
+            return False
+
+        def accept():
+            actual, _, _ = text_geometry(annotation)
+            strokes = dimension_lines(annotation)
+            if (_fits_detail(actual, self.frame, foreign, [box for box, _ in used], own, edges)
+                    and _routes_fit(actual, strokes, foreign, used)):
+                self.occupied[key] = actual, strokes
+                return True
+            return False
+
+        if accept():
+            return True
+        outer = candidates(origin, box, own, kind, angle)
+        inner = _interior_candidates(origin, box, own) if edges else ()
+        for position, predicted in (*outer, *inner):
+            if not _fits_detail(predicted, self.frame, foreign, [box for box, _ in used], own, edges):
+                continue
+            if optional(annotation, "SetPosition2", *position) and accept():
+                return True
+        optional(annotation, "SetPosition2", *origin)
+        return False
+
+    def free_diameter_routes(self, view, original, anchors, label_size, centerlines):
+        """Suggest short routes, then check the geometry actually drawn by SolidWorks."""
+        name, _ = key = self._key(view, original)
+        edges = self.edges.get(name, ())
+        if not edges:  # No reliable way to check the leader against this view.
+            return
+        occupied = [row for entry, row in self.occupied.items() if entry != key]
+        boxes = [box for box, _ in occupied]
+        foreign = (*self.reserved, *(box for other, box in self.boxes.items() if other != name))
+        obstacles = tuple(chain(edges, centerlines, *(lines for _, lines in occupied)))
+        proposals = _leader_positions(anchors, *label_size, self.frame, self.boxes[name],
+                                      foreign, boxes, obstacles)
+
+        def accept(annotation, center, radius):
+            box = text_geometry(annotation)[0]
+            strokes = dimension_lines(annotation)
+            return (fits(box, self.frame, foreign, boxes)
+                    and not any(crosses(edge, box) for edge in obstacles)
+                    and _routes_fit(box, strokes, foreign, occupied)
+                    and _clear_leader(strokes, obstacles, center, radius+.0004))
+
+        for _, _, anchor, position, center, radius in islice(proposals, 24):
+            yield anchor, position, center, radius, accept

@@ -145,6 +145,14 @@ def primary_axis(model):
     return max((2, 1, 0), key=lambda a: areas[a] / largest + min(bore_counts[a], 8) * .18)
 
 
+def perpendicular_flange_profile(model):
+    if model.sheet_metal:
+        axes = {bore.axis for bore in model.bores}
+        if len(axes) == 2:
+            return next(i for i in range(3) if i not in axes)
+    return None
+
+
 def _coaxial_groups(bores):
     groups = defaultdict(list)
     for bore in bores:

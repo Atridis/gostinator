@@ -72,27 +72,27 @@ def drawing_template(app):
                             "«Шаблоны по умолчанию»")
 
 
-def _same_path(doc, part):
+def _same_path(doc, path):
     opened = get_value(doc, "GetPathName")
-    return bool(opened) and Path(opened).resolve() == part
+    return bool(opened) and Path(opened).resolve() == path
 
 
 @contextmanager
-def _open_part(app, part, *, read_only=True):
-    existing = get_value(app, "GetOpenDocumentByName", str(part))
-    if existing is not None and _same_path(existing, part):
+def _open_document(app, path, *, read_only=True):
+    existing = get_value(app, "GetOpenDocumentByName", str(path))
+    if existing is not None and _same_path(existing, path):
         yield existing
         return
 
-    spec = get_value(app, "GetOpenDocSpec", str(part))
-    spec.DocumentType = SW_DOC_PART
+    spec = get_value(app, "GetOpenDocSpec", str(path))
+    spec.DocumentType = SW_DOC_DRAWING if path.suffix.casefold() == ".slddrw" else SW_DOC_PART
     spec.ReadOnly = read_only
     spec.Silent = True
     doc = get_value(app, "OpenDoc7", spec)
     if doc is None:
-        raise RuntimeError("SolidWorks не открыл модель")
-    if not _same_path(doc, part):
-        raise RuntimeError("В SolidWorks уже открыта другая модель с таким именем")
+        raise RuntimeError(f"SolidWorks не открыл файл {path.name}")
+    if not _same_path(doc, path):
+        raise RuntimeError("В SolidWorks уже открыт другой документ с таким именем")
     title = get_value(doc, "GetTitle")
     try:
         yield doc
@@ -133,11 +133,32 @@ def _hide_reference_markers(drawing):
         get_value(drawing, "GraphicsRedraw2")
 
 
+def _export_saved_flat_pdf(app, target, pdf):
+    from .annotation_layout import geometry_outline, view_strokes
+    from .drawing_views import drawing_views
+
+    # Export from the persisted drawing after the writable copy of the
+    # part has closed. A freshly created flat view can have its annotations
+    # available before SolidWorks has a complete printable contour.
+    with _open_document(app, target) as drawing:
+        get_value(drawing, "ViewZoomtofit2")
+        get_value(drawing, "GraphicsRedraw2")
+        for view in drawing_views(drawing):
+            if not get_value(view, "IsFlatPatternView"):
+                continue
+            outline = get_value(view, "GetOutline")[:4]
+            contour = geometry_outline(view_strokes(view, outline), None)
+            if contour is not None and contour[2] > contour[0] and contour[3] > contour[1]:
+                _save(drawing, pdf)
+                return
+        raise RuntimeError("В сохранённом чертеже SolidWorks не подтвердил контур развёртки")
+
+
 def convert_part(app, part, template, staging):
     """Generate native views and publishable files without reading the PDF."""
     from .model_geometry import read_model
 
-    with _open_part(app, part) as model_doc:
+    with _open_document(app, part) as model_doc:
         try:
             model = read_model(model_doc)
         except (AttributeError, com_error) as exc:
@@ -147,12 +168,14 @@ def convert_part(app, part, template, staging):
             cache = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
             root = cache / "Gostinator" / "models"
             cached_model = root / f"{uuid4().hex}.SLDPRT"
+            pair = None
             try:
                 root.mkdir(parents=True, exist_ok=True)
                 copy2(part, cached_model)
-                with _open_part(app, cached_model, read_only=False) as writable:
+                with _open_document(app, cached_model, read_only=False) as writable:
                     pair = _generate_drawing(app, cached_model, template, staging,
                                              model, writable_flat_source=writable)
+                _export_saved_flat_pdf(app, *pair)
                 print(f"    Связанная модель развёртки — {cached_model}", flush=True)
                 return pair
             except (AttributeError, OSError, RuntimeError, com_error) as exc:
@@ -160,6 +183,8 @@ def convert_part(app, part, template, staging):
                     cached_model.unlink(missing_ok=True)
                 except OSError:
                     pass
+                if pair is not None:
+                    raise RuntimeError(f"Не удалось выгрузить PDF с развёрткой — {exc}") from exc
                 print(f"[WARN] Развёртка пропущена — {exc}", flush=True)
         try:
             return _generate_drawing(app, part, template, staging, model)
@@ -177,7 +202,8 @@ class NativeDraftError(RuntimeError):
 def _generate_drawing(app, part, template, staging, model, *, writable_flat_source=None):
     from .annotation_layout import arrange_dimensions, omit_repeated_section_scales, set_black_dimension_color
     from .drawing_dimensions import add_dimensions, prune_duplicate_bore_diameters, prune_model_dimensions
-    from .drawing_views import create_flat_pattern, create_views, sheet_frame
+    from .drawing_views import add_view_centerlines, create_flat_pattern, create_views, sheet_frame
+    from .hole_annotations import add_hole_center_marks, add_hole_quantities
     from .sheet_layout import (
         Layout, PAPERS, Paper, choose_layout, configure_sheet, installed_formats,
         synchronize_sheet_scale,
@@ -225,26 +251,53 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
                       SW_DIMENSIONS_MARKED_FOR_DRAWING, True, False, False, False)
         except com_error as exc:
             print(f"[WARN] Не удалось импортировать размеры модели — {exc}", flush=True)
+        flat_model = None
         if include_flat:
             # The flat blank must not take ownership of any imported model
             # dimensions. Its envelope is dimensioned separately below.
-            views.append(create_flat_pattern(drawing, part, layout))
+            flat_name, flat_model = create_flat_pattern(drawing, part, layout, writable_flat_source)
+            views.append(flat_name)
         if views:
             print(f"    Видов — {len(views)}", flush=True)
         if model is not None:
             try:
                 skipped = prune_model_dimensions(drawing)
-                count, cut_diameters = add_dimensions(drawing, model, frame)
+                count, cut_diameters, section_axes, hole_views = add_dimensions(
+                    drawing, model, frame, flat_model=flat_model)
                 visible, moved, hidden = arrange_dimensions(drawing, frame)
                 duplicates = prune_duplicate_bore_diameters(drawing, model, cut_diameters)
-                visible -= duplicates
-                skipped += duplicates
             except (AttributeError, RuntimeError, com_error) as exc:
                 raise NativeDraftError(str(exc)) from exc
-            print(f"    Размеров по геометрии — {count}, повторных и висячих скрыто — {skipped}",
+            quantities = 0
+            try:
+                quantities, repeated = add_hole_quantities(drawing, frame, hole_views, cut_diameters)
+                duplicates += repeated
+            except (AttributeError, com_error) as exc:
+                print(f"[WARN] Не удалось сгруппировать обозначения отверстий — {exc}", flush=True)
+            visible -= duplicates
+            skipped += duplicates
+            print(f"    Размеров по геометрии — {count}, размеров скрыто — {skipped}",
                   flush=True)
             print(f"    Оставлено размеров — {visible}, перемещено — {moved}, скрыто при компоновке — {hidden}",
                   flush=True)
+            if quantities:
+                print(f"    Групповых обозначений отверстий — {quantities}", flush=True)
+            try:
+                centered = sum(add_view_centerlines(drawing, view, axes) for view, axes in section_axes)
+                if centered:
+                    print(f"    Осевых в разрезе — {centered}", flush=True)
+            except (AttributeError, com_error) as exc:
+                print(f"[WARN] Не удалось добавить осевые в разрез — {exc}", flush=True)
+            try:
+                marks = links = 0
+                for view, holes, matrix, _ in hole_views:
+                    made, joined = add_hole_center_marks(drawing, view, holes, matrix[12])
+                    marks += made
+                    links += joined
+                if marks:
+                    print(f"    Центровых обозначений — {marks}, соединений осей — {links}", flush=True)
+            except (AttributeError, com_error) as exc:
+                print(f"[WARN] Не удалось добавить центровые обозначения — {exc}", flush=True)
         if writable_flat_source is not None and not get_value(
                 writable_flat_source, "Save3", SW_SAVE_SILENT,
                 VARIANT(VT_BYREF | VT_I4, 0), VARIANT(VT_BYREF | VT_I4, 0)):
@@ -257,7 +310,8 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
         except (AttributeError, com_error) as exc:
             print(f"[WARN] Не удалось задать чёрный цвет размеров — {exc}", flush=True)
         _save(drawing, target)
-        _save(drawing, pdf)
+        if not include_flat:
+            _save(drawing, pdf)
     finally:
         try:
             _close(app, get_value(drawing, "GetTitle"))

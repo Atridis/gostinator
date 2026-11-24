@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pythoncom import com_error
 
-from .model_geometry import choose_section, needs_reverse, primary_axis
+from .model_geometry import choose_section, needs_reverse, perpendicular_flange_profile, primary_axis
 from .solidworks import get_value
 
 
@@ -75,6 +75,19 @@ def view_slots(model, first_angle, flat):
     side, other = axes
     side_sign = -1 if side == 0 else 1
     if model.sheet_metal:
+        profile = perpendicular_flange_profile(model)
+        if profile is not None:
+            horizontal, vertical = VIEW_AXES[profile]
+            folded = (
+                ViewSlot(profile, 1, 0, 1),
+                ViewSlot(vertical, 1 if first_angle else -1, 0, 0,
+                         turn=VIEW_AXES[vertical][0] != horizontal),
+                ViewSlot(horizontal, -1 if first_angle else 1, 1, 1,
+                         turn=VIEW_AXES[horizontal][1] != vertical),
+            )
+            if flat:
+                return (*folded, ViewSlot(vertical, 1, 1, 0, "flat", turn=True))
+            return folded
         offset = int(flat)
         folded = (ViewSlot(side, side_sign, 0, 1+offset), ViewSlot(axis, 1, 0, offset))
         if flat:
@@ -129,7 +142,11 @@ def choose_layout(model, first_angle, flat, *, papers=PAPERS):
     if flat:
         # The flat blank can grow in the bend direction; check its actual
         # outline after inserting it and before placing any dimensions.
-        extents[-1] = (extents[-1][0] * 1.15, extents[-1][1] * 1.15)
+        if slots[-1].turn:
+            profile = slots[0].axis
+            extents[-1] = (model.spans[profile], sum(model.spans[axis] for axis in VIEW_AXES[profile]))
+        else:
+            extents[-1] = (extents[-1][0] * 1.15, extents[-1][1] * 1.15)
     gap = .024 + min(.025, len(model.bores) * .00055)
     choices = [(paper, scale) for paper in papers
                for scale in ((4., 2., 1.) if paper.name == "A4" else (1.,))]

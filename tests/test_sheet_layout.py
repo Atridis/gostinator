@@ -43,6 +43,19 @@ def test_flat_pattern_uses_a_separate_scale_and_row():
     assert len({y for _, y in layout.positions}) == 3
 
 
+def test_holes_on_perpendicular_sheet_flanges_get_two_face_views_and_portrait_blank():
+    model = Model((0., -.008, 0., .064, .044, .024), (
+        Bore(1, (.025, .012), .0045, -.008, 0.),
+        Bore(0, (.032, .012), .00335, .056, .064),
+    ), True)
+    layout = choose_layout(model, True, True)
+    assert layout.paper.name == "A4" and layout.scale == 1.
+    assert [(slot.axis, slot.sign) for slot in layout.slots[:3]] == [(2, 1), (1, 1), (0, -1)]
+    assert [(slot.column, slot.row) for slot in layout.slots] == [(0, 1), (0, 0), (1, 1), (1, 0)]
+    assert layout.slots[-1].role == "flat" and layout.slots[-1].turn
+    assert layout.slots[-1].factor == 1.
+
+
 def test_sheet_metal_uses_two_folded_views_if_blank_is_unavailable():
     model = Model((0., 0., 0., .112, .043, .048), (), True)
     layout = choose_layout(model, True, False)

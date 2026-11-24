@@ -4,17 +4,57 @@ from types import SimpleNamespace
 import pytest
 
 from gostinator.drawing_dimensions import (
-    Anchor, Line, Task, _blank_extent_tasks, _corner_cut_tasks, _folded_profile_shift, _geometry_key,
-    _overall_tasks, _physical_profile_key, _recess_tasks,
+    Anchor, Circle, Line, Task, _arc_vertex_shift, _blank_extent_tasks, _closed_inner_contours, _corner_cut_tasks,
+    _cut_depth, _depth_extends_past_material, _folded_profile_shift, _geometry_key,
+    _overall_tasks, _physical_profile_key, _recess_tasks, _section_axis_lines,
     _section_datums, _section_depth_task, _section_frame, _select_section_edge, _stock_span_tasks,
     prune_duplicate_bore_diameters,
 )
-from gostinator.drawing_views import project
-from gostinator.model_geometry import Bore, Model, _read_cylinders, choose_section, needs_reverse, primary_axis
+from gostinator.drawing_views import _flat_plane, project
+from gostinator.model_geometry import Bore, Model, Section, _read_cylinders, choose_section, needs_reverse, primary_axis
 
 
 def _bore(center, radius, low, high, axis=2):
     return Bore(axis, center, radius, low, high)
+
+
+def test_cut_depth_requires_a_subtractive_feature_and_matching_depth_parameter():
+    definition = SimpleNamespace(BothDirections=True, GetDepth=lambda forward: .02 if forward else .006,
+                                 GetEndCondition=lambda forward: 0)
+    cut = SimpleNamespace(GetTypeName2="Cut", GetDefinition=definition)
+    boss = SimpleNamespace(GetTypeName2="Boss", GetDefinition=definition)
+    imported = SimpleNamespace(GetFeatureOwner=cut, GetSystemValue2=lambda *_: .006)
+    stock = SimpleNamespace(GetFeatureOwner=boss, GetSystemValue2=lambda *_: .02)
+    other_cut_parameter = SimpleNamespace(GetFeatureOwner=cut, GetSystemValue2=lambda *_: .004)
+    assert _cut_depth(None, imported, "D2@Cut@Piece.Part") == .006
+    assert _cut_depth(None, stock, "D1@Boss@Piece.Part") is None
+    assert _cut_depth(None, other_cut_parameter, "D3@Cut@Piece.Part") is None
+    assert _cut_depth(None, imported, "RD1@Section@Sheet.Drawing") is None
+
+
+def test_cut_length_checks_the_real_material_end_and_keeps_depths_inside_stock():
+    contour = (((.05, .10), (.15, .10)), ((.15, .10), (.15, .115)),
+               ((.15, .115), (.05, .115)), ((.05, .115), (.05, .10)))
+    assert _depth_extends_past_material(((.18, .10), (.18, .12)), contour, .02, 1.)
+    assert _depth_extends_past_material(((.18, .115), (.18, .095)), contour, .02, 1.)
+    assert not _depth_extends_past_material(((.18, .10), (.18, .115)), contour, .015, 1.)
+    assert not _depth_extends_past_material(((.18, .115), (.18, .109)), contour, .006, 1.)
+    assert not _depth_extends_past_material(((.18, .10), (.18, .12)), contour, .02, 2.)
+    assert not _depth_extends_past_material(((.18, .10), (.18, .12)), (), .02, 1.)
+    assert not _depth_extends_past_material(((.18, .130), (.18, .150)), contour, .02, 1.)
+
+
+def test_sheet_blank_plane_is_validated_against_its_actual_thickness():
+    face = SimpleNamespace(Normal=(0., 1., 0.), GetArea=.002)
+
+    def shape(height):
+        vertices = (SimpleNamespace(GetPoint=(0., 0., 0.)),
+                    SimpleNamespace(GetPoint=(.101, height, .024)))
+        body = SimpleNamespace(GetFaces=(face,), GetVertices=vertices)
+        return SimpleNamespace(GetBodies2=lambda *_: (body,))
+
+    assert _flat_plane(shape(.008), .008) == (0., 1., 0.)
+    assert _flat_plane(shape(.052), .008) is None
 
 
 def test_view_choice_prioritizes_a_row_of_real_bores():
@@ -32,6 +72,29 @@ def test_view_choice_prioritizes_a_row_of_real_bores():
     assert primary_axis(rotated) == 2
     assert choose_section(rotated, 2).along == 1
     assert choose_section(Model(model.bounds, model.bores, True), 2) is None
+
+
+def test_section_axes_cover_coaxial_steps_and_closed_slots_only():
+    cut = Section(0, 0., (
+        _bore((.010, 0.), .002, .0005, .006),
+        _bore((.010, 0.), .003, .006, .0115),
+    ))
+    matrix = (1, 0, 0, 0, 0, 1, 0, 1, 0, .10, .10, 0, 1, 0, 0, 0)
+    base_matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, .10, .10, 0, 1, 0, 0, 0)
+    hatches = tuple((lo, 0., 0., hi, 0., .012)
+                    for lo, hi in ((0., .008), (.012, .018), (.022, .028), (.032, .040)))
+    closed = ((.118, .098), (.122, .098), (.122, .102), (.118, .102), (.118, .098))
+    opened = ((.128, .098), (.132, .098), (.132, .102), (.128, .102))
+    strokes = [*zip(closed, closed[1:]), *zip(opened, opened[1:])]
+    contours = tuple(_closed_inner_contours(strokes, (.10, .09, .14, .11)))
+
+    lines = _section_axis_lines(cut, matrix, (0., 0., 0.), hatches, base_matrix, contours)
+
+    assert len(lines) == 2
+    for axis_line, x in zip(lines, (.110, .120)):
+        a, b = axis_line
+        assert a == pytest.approx((x, .098, 0.))
+        assert b == pytest.approx((x, .114, 0.))
 
 
 @pytest.mark.parametrize(("same_profile", "cut_visible", "extra_text", "removed"), [
@@ -127,6 +190,17 @@ def test_blank_dimensions_only_cover_the_confirmed_contour_extents():
     assert task.direction == 1  # the vertices don't reach the full width
 
 
+def test_rounded_blank_uses_native_arc_attachments_for_its_overall_length():
+    matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+    anchors = [Anchor(object(), p, p) for p in (
+        (.012, 0., 0.), (.088, 0., 0.), (.012, .024, 0.), (.088, .024, 0.))]
+    ends = [Circle(Anchor(object(), p, p), 2, .012, .50)
+            for p in ((.012, .012, 0.), (.088, .012, 0.))]
+    tasks = list(_blank_extent_tasks(anchors, matrix, (0., 0., .100, .024), ends))
+    assert {(task.direction, round(task.nominal, 6), task.arc_ends) for task in tasks} == {
+        (0, .100, 2), (1, .024, 0)}
+
+
 def test_opposite_views_deduplicate_the_same_span_but_keep_an_independent_span():
     front = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
     back = (-1, 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0)
@@ -165,6 +239,27 @@ def test_folded_view_registration_checks_the_available_stock_extents():
                Anchor(None, (.222, .210, .05), ()))
     assert _folded_profile_shift(shifted, model, 2, (.112, .170)) == (.112, .170, 0.)
     assert _folded_profile_shift(shifted, model, 2, (.112, .182)) is None
+
+
+def test_sheet_outline_registration_matches_raw_arc_ends_to_shifted_vertices():
+    points = ((.015, -.012, 0.), (.015, .012, 0.))
+    circle = Circle(Anchor(None, (.015, 0., 0.), ()), 2, .012, .5, points)
+    shifted = [Anchor(None, (x+.11, y+.17, z), ()) for x, y, z in points]
+    unshifted = [Anchor(None, point, ()) for point in points]
+
+    assert _arc_vertex_shift(shifted, [circle], (.11, .17)) == (.11, .17, 0.)
+    assert _arc_vertex_shift(unshifted, [circle], (.11, .17)) == (0., 0., 0.)
+    assert _arc_vertex_shift(shifted, [circle], (.11, .15)) is None
+
+
+def test_flat_width_prefers_opposite_parallel_edges_over_tangency_vertices():
+    matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+    left, right = [Line(object(), tuple(Anchor(object(), p, p) for p in ((x, 0., 0.), (x, .06, 0.))))
+                   for x in (0., .024)]
+    width, = _blank_extent_tasks(left.ends+right.ends, matrix, (0., -.012, .024, .072),
+                                 lines=(left, right))
+    assert width.nominal == pytest.approx(.024)
+    assert tuple(a.entity for a in width.targets) == (left.entity, right.entity)
 
 
 def test_corner_cutback_needs_two_perpendicular_incident_rails():

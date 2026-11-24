@@ -5,8 +5,14 @@ from math import dist, isfinite, pi
 from pythoncom import VT_DISPATCH, com_error
 from win32com.client import VARIANT
 
-from .model_geometry import VIEWS, choose_section
+from .model_geometry import VIEWS, choose_section, read_model
 from .solidworks import as_dispatch, get_value
+
+
+SW_LINE_CENTER = 4
+SW_LINE_WEIGHT_THIN = 0
+SW_UNSUPPRESS_FEATURE = 1
+SW_THIS_CONFIGURATION = 1
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,48 @@ def transform_of(view):
 def project(point, matrix):
     return tuple(sum(point[i] * matrix[3*i + j] for i in range(3)) * matrix[12] + matrix[9 + j]
                  for j in range(3))
+
+
+def add_view_centerlines(doc, view, axes, *, circles=()):
+    if not axes and not circles:
+        return 0
+    box = get_value(view, "GetOutline")[:4]
+    axes = [line for line in axes if all(box[i] - .002 <= point[i] <= box[i+2] + .002
+                                       for point in line for i in (0, 1))]
+    circles = [(center, radius) for center, radius in circles
+               if all(box[i] <= center[i]-radius and center[i]+radius <= box[i+2] for i in (0, 1))]
+    if not axes and not circles:
+        return 0
+    get_value(doc, "ClearSelection2", True)
+    if not get_value(doc, "ActivateView", get_value(view, "GetName2")):
+        return 0
+    try:
+        sketch = get_value(view, "GetSketch")
+        transform = get_value(sketch, "ModelToSketchTransform")
+        direct = get_value(transform, "ArrayData")
+        inverse = get_value(get_value(transform, "Inverse"), "ArrayData")
+        manager = get_value(doc, "SketchManager")
+        added = 0
+        def line_segment(a, b):
+            local = tuple(project(point, direct) for point in (a, b))
+            if any(dist(project(point, inverse), original) > 1e-7
+                   for point, original in zip(local, (a, b))):
+                return None
+            return get_value(manager, "CreateLine", *local[0], *local[1])
+
+        segments = (line_segment(a, b) for a, b in axes)
+        circular = (get_value(manager, "CreateCircleByRadius", *project(center, direct), radius*direct[12])
+                    for center, radius in circles)
+        for segment in (*segments, *circular):
+            if segment is not None:
+                segment.Style = SW_LINE_CENTER
+                segment.Width = SW_LINE_WEIGHT_THIN
+                segment.Color = 0
+                added += 1
+        return added
+    finally:
+        get_value(doc, "ClearSelection2", True)
+        get_value(doc, "ActivateView", "")
 
 
 def _create(doc, part, axis, sign, position, scale):
@@ -141,7 +189,9 @@ def create_views(doc, part, model, frame, layout=None):
             if cut is None:
                 _create(doc, part, slot.axis, slot.sign, position, scale)
         else:
-            _create(doc, part, slot.axis, slot.sign, position, scale)
+            view = _create(doc, part, slot.axis, slot.sign, position, scale)
+            if slot.turn:
+                view.Angle = pi / 2
     get_value(doc, "EditRebuild3")
     views = drawing_views(doc)
     if not views:
@@ -149,14 +199,118 @@ def create_views(doc, part, model, frame, layout=None):
     return [str(get_value(view, "GetName2")) for view in views]
 
 
-def create_flat_pattern(doc, part, layout):
+def _flat_plane(part, thickness):
+    bodies = get_value(part, "GetBodies2", 0, False) or ()
+    if len(bodies) != 1:
+        return None
+    body = as_dispatch(bodies[0])
+    faces = (as_dispatch(raw) for raw in get_value(body, "GetFaces") or ())
+    planes = [(get_value(face, "GetArea"), normal) for face in faces
+              if (normal := get_value(face, "Normal")) and sum(v*v for v in normal) > .99]
+    if not planes:
+        return None
+    _, normal = max(planes, key=lambda row: row[0])
+    points = (get_value(as_dispatch(vertex), "GetPoint")
+              for vertex in get_value(body, "GetVertices") or ())
+    depths = [sum(a*b for a, b in zip(point, normal)) for point in points if point]
+    if depths and abs(max(depths) - min(depths) - thickness) <= max(.000075, .005*thickness):
+        return normal
+    return None
+
+
+def _prepare_flat_configuration(part, folded_name, flat_name):
+    if not flat_name or flat_name == folded_name or not get_value(part, "ShowConfiguration2", flat_name):
+        raise RuntimeError("SolidWorks не переключился на отдельную конфигурацию развёртки")
+    try:
+        patterns = []
+        thickness = None
+        feature = get_value(part, "FirstFeature")
+        while feature is not None:
+            kind = get_value(feature, "GetTypeName2")
+            if kind == "FlatPattern":
+                patterns.append(feature)
+            elif kind in ("SheetMetal", "SMBaseFlange") and thickness is None:
+                definition = get_value(feature, "GetDefinition")
+                candidate = get_value(definition, "Thickness") if definition is not None else None
+                if isinstance(candidate, (float, int)) and candidate > 0:
+                    thickness = candidate
+            feature = get_value(feature, "GetNextFeature")
+        if thickness is None:
+            raise RuntimeError("В модели не найдена толщина листового металла")
+        if len(patterns) == 1 and any(get_value(patterns[0], "IsSuppressed2", SW_THIS_CONFIGURATION, None) or ()):
+            if not get_value(patterns[0], "SetSuppression2", SW_UNSUPPRESS_FEATURE, SW_THIS_CONFIGURATION, None):
+                raise RuntimeError("SolidWorks не включил операцию разворачивания листа")
+            if not get_value(part, "ForceRebuild3", False):
+                raise RuntimeError("SolidWorks не перестроил конфигурацию развёртки")
+        normal = _flat_plane(part, thickness)
+        if normal is None:
+            raise RuntimeError("Конфигурация развёртки не содержит плоской заготовки")
+        try:
+            blank = read_model(part)
+        except (AttributeError, com_error):
+            blank = None
+        return normal, blank
+    finally:
+        if not get_value(part, "ShowConfiguration2", folded_name):
+            raise RuntimeError("SolidWorks не вернул согнутую конфигурацию модели")
+
+
+def _flat_view_faces_blank(view, plane):
+    normal = transform_of(view)[2:9:3]
+    return abs(sum(a*b for a, b in zip(normal, plane))) >= .999
+
+
+def create_flat_pattern(doc, part, layout, writable_part):
+    from .annotation_layout import FLAT_PATTERN_CAPTION, _place_flat_caption, geometry_outline, view_strokes
+
     slot = layout.slots[-1]
-    view = get_value(doc, "CreateFlatPatternViewFromModelView3",
-                     str(part), "", *layout.positions[-1], 0., False, False)
-    if view is None or not get_value(view, "IsFlatPatternView"):
-        raise RuntimeError("SolidWorks не подтвердил нативную развёртку")
+    manager = get_value(writable_part, "ConfigurationManager")
+    folded_name = get_value(get_value(manager, "ActiveConfiguration"), "Name")
+
+    def insert(config):
+        view = get_value(doc, "CreateFlatPatternViewFromModelView3",
+                         str(part), config, *layout.positions[-1], 0., False, False)
+        if view is None or not get_value(view, "IsFlatPatternView"):
+            raise RuntimeError("SolidWorks не подтвердил нативную развёртку")
+        return view
+
+    view = insert(folded_name)
+    flat_name = get_value(view, "ReferencedConfiguration")
+    plane, blank = _prepare_flat_configuration(writable_part, folded_name, flat_name)
+    get_value(doc, "EditRebuild3")
+    if not _flat_view_faces_blank(view, plane):
+        get_value(doc, "ClearSelection2", True)
+        extension = get_value(doc, "Extension")
+        if not (get_value(extension, "SelectByID2", get_value(view, "GetName2"), "DRAWINGVIEW",
+                          0., 0., 0., False, 0, VARIANT(VT_DISPATCH, None), 0)
+                and _delete_selected(doc)):
+            raise RuntimeError("SolidWorks не заменил торцевой вид развёртки")
+        view = insert(folded_name)
+        if get_value(view, "ReferencedConfiguration") != flat_name or not _flat_view_faces_blank(view, plane):
+            raise RuntimeError("SolidWorks не построил вид нормалью к плоской заготовке")
     view.UseSheetScale = False
     view.ScaleDecimal = layout.scale * slot.factor
     view.ShowSheetMetalBendNotes = False
     get_value(doc, "EditRebuild3")
-    return str(get_value(view, "GetName2"))
+    if slot.turn:
+        x0, y0, x1, y1 = get_value(view, "GetOutline")[:4]
+        if x1 - x0 > y1 - y0:
+            view.Angle = get_value(view, "Angle") + pi / 2
+            get_value(doc, "EditRebuild3")
+    name = str(get_value(view, "GetName2"))
+    get_value(doc, "ClearSelection2", True)
+    if get_value(doc, "ActivateView", name):
+        try:
+            note = get_value(doc, "InsertNote", FLAT_PATTERN_CAPTION)
+            if note is not None:
+                annotation = get_value(note, "GetAnnotation")
+                font = get_value(annotation, "GetTextFormat", 0)
+                font.CharHeight = .004
+                get_value(annotation, "SetTextFormat", 0, False, font)
+                get_value(doc, "ViewZoomtofit2")
+                outline = get_value(view, "GetOutline")[:4]
+                _place_flat_caption(annotation, geometry_outline(view_strokes(view, outline), outline))
+        finally:
+            get_value(doc, "ClearSelection2", True)
+            get_value(doc, "ActivateView", "")
+    return name, blank

@@ -88,6 +88,40 @@ def test_save_uses_legacy_method_when_solidworks_rejects_saveas(tmp_path):
     assert pdf.read_bytes() == b"%PDF"
 
 
+@pytest.mark.parametrize("has_contour", [True, False])
+def test_flat_pdf_is_exported_from_reopened_drawing_with_a_contour(
+        tmp_path, monkeypatch, has_contour):
+    from gostinator import annotation_layout
+
+    target = tmp_path / "blank.SLDDRW"
+    pdf = target.with_suffix(".pdf")
+    view = SimpleNamespace(IsFlatPatternView=True, GetOutline=(0., 0., .05, .05))
+    drawing = SimpleNamespace(GetViews=((None, view),),
+                              ViewZoomtofit2=Mock(spec=lambda: None), GraphicsRedraw2=Mock(spec=lambda: None))
+    opened = []
+
+    @contextmanager
+    def reopen(app, path):
+        opened.append(path)
+        yield drawing
+
+    strokes = (((.01, .01), (.04, .01)), ((.04, .01), (.04, .04))) if has_contour else ()
+    monkeypatch.setattr(annotation_layout, "view_strokes", lambda *_: strokes)
+    monkeypatch.setattr(solidworks, "_open_document", reopen)
+    save = Mock()
+    monkeypatch.setattr(solidworks, "_save", save)
+    if has_contour:
+        solidworks._export_saved_flat_pdf(object(), target, pdf)
+        save.assert_called_once_with(drawing, pdf)
+    else:
+        with pytest.raises(RuntimeError, match="контур развёртки"):
+            solidworks._export_saved_flat_pdf(object(), target, pdf)
+        save.assert_not_called()
+    assert opened == [target]
+    drawing.ViewZoomtofit2.assert_called_once_with()
+    drawing.GraphicsRedraw2.assert_called_once_with()
+
+
 @pytest.mark.parametrize("first_angle,already_open", [(True, False), (False, True)])
 def test_convert_uses_native_projection_and_keeps_user_document_open(
         tmp_path, first_angle, already_open, monkeypatch):
