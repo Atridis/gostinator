@@ -3,7 +3,8 @@ from collections import namedtuple
 from math import cos, dist, isfinite, sin
 from pathlib import Path
 
-from pythoncom import com_error
+from pythoncom import VT_BYREF, VT_VARIANT, com_error
+from win32com.client import VARIANT
 
 from .drawing_views import drawing_views
 from .solidworks import as_dispatch, get_value
@@ -80,6 +81,48 @@ def dimension_lines(annotation):
     return tuple(strokes)
 
 
+def _polyline_strokes(values, transform):
+    if not values or not transform or len(transform) != 3 or transform[2] <= 0:
+        return ()
+    tx, ty, scale = transform
+    strokes = []
+    offset = 0
+    while offset + 8 < len(values):
+        # Type, geometry payload length, payload, six display attributes,
+        # point count, then XYZ points in unscaled view coordinates.
+        count_at = offset + 8 + int(values[offset + 1])
+        if not offset + 8 <= count_at < len(values):
+            return ()
+        next_polyline = count_at + 1 + 3 * int(values[count_at])
+        if not count_at < next_polyline <= len(values):
+            return ()
+        points = [(tx + scale*values[i], ty + scale*values[i+1])
+                  for i in range(count_at + 1, next_polyline, 3)]
+        strokes.extend(zip(points, points[1:]))
+        offset = next_polyline
+    return tuple(strokes) if offset == len(values) else ()
+
+
+def view_strokes(view, outline):
+    coordinates = VARIANT(VT_BYREF | VT_VARIANT, None)
+    optional(view, "GetPolylines7", 0, coordinates)
+    strokes = _polyline_strokes(coordinates.value, optional(view, "GetXform"))
+    # Keep the external placement rule on views where the projected edges
+    # are unavailable or use a coordinate system we cannot verify.
+    if not all(outline[0] - .001 <= x <= outline[2] + .001
+               and outline[1] - .001 <= y <= outline[3] + .001
+               for line in strokes for x, y in line):
+        return ()
+    return strokes
+
+
+def geometry_outline(strokes, fallback):
+    if not strokes:
+        return fallback
+    points = [point for line in strokes for point in line]
+    return tuple(f(point[i] for point in points) for f in (min, max) for i in (0, 1))
+
+
 def intersects(a, b, clearance=0.):
     return (a[0] < b[2] + clearance and b[0] < a[2] + clearance
             and a[1] < b[3] + clearance and b[1] < a[3] + clearance)
@@ -110,6 +153,18 @@ def crosses(segment, box):
     return True
 
 
+def _fits_detail(box, allowed, other_boxes, used, own, model_strokes):
+    if not fits(box, allowed, other_boxes, used):
+        return False
+    if not intersects(box, own, .0008):
+        return True
+    margin = .001
+    padded = (box[0]-margin, box[1]-margin, box[2]+margin, box[3]+margin)
+    return (bool(model_strokes) and own[0] <= padded[0] and own[1] <= padded[1]
+            and padded[2] <= own[2] and padded[3] <= own[3]
+            and not any(crosses(line, padded) for line in model_strokes))
+
+
 def _routes_fit(box, strokes, foreign_views, occupied):
     for text, lines in occupied:
         if any(crosses(new, text) for new in strokes) or any(crosses(old, box) for old in lines):
@@ -136,6 +191,39 @@ def format_zones(doc, frame):
     return tuple(zones)
 
 
+def section_captions(view):
+    if get_value(view, "Type") != 2:
+        return
+    for raw in optional(view, "GetNotes") or ():
+        note = as_dispatch(raw)
+        linked = str(optional(note, "PropertyLinkedText") or "")
+        if "<VLLABEL>" in linked:
+            annotation = optional(note, "GetAnnotation")
+            if annotation is not None and optional(annotation, "Visible") == 1:
+                yield annotation
+
+
+def _place_caption(annotation, own, allowed, outlines, occupied):
+    box, _, _ = text_geometry(annotation)
+    if box is None or fits(box, allowed, outlines, occupied):
+        return box
+    position = optional(annotation, "GetPosition")
+    if not position or len(position) < 3:
+        return box
+    width, height = box[2] - box[0], box[3] - box[1]
+    x = (own[0] + own[2] - width) / 2
+    for y in (own[3] + .002, own[1] - height - .002):
+        candidate = (x, y, x + width, y + height)
+        if not fits(candidate, allowed, outlines, occupied):
+            continue
+        optional(annotation, "SetPosition2", position[0] + x - box[0], position[1] + y - box[1], position[2])
+        placed, _, _ = text_geometry(annotation)
+        if fits(placed, allowed, outlines, occupied):
+            return placed
+    optional(annotation, "SetPosition2", *position[:3])
+    return box
+
+
 def candidates(anchor, box, view, kind, angle):
     x, y, z = anchor
     x0, y0, x1, y1 = view
@@ -156,6 +244,20 @@ def candidates(anchor, box, view, kind, angle):
             yield (x+dx, y+dy, z), (box[0]+dx, box[1]+dy, box[2]+dx, box[3]+dy)
 
 
+def _interior_candidates(anchor, box, view):
+    center = tuple((box[i]+box[i+2])/2 for i in (0, 1))
+    room = tuple((box[i+2]-box[i])/2 + .002 for i in (0, 1))
+    if any(view[i] + 2*room[i] > view[i+2] for i in (0, 1)):
+        return
+    x, y = (min(max(center[i], view[i]+room[i]), view[i+2]-room[i]) for i in (0, 1))
+    for dx, dy in ((0., 0.), (.005, 0.), (-.005, 0.), (0., .005), (0., -.005),
+                   (.010, 0.), (-.010, 0.), (0., .010), (0., -.010)):
+        sx, sy = x+dx-center[0], y+dy-center[1]
+        if abs(sx)+abs(sy) <= .042:
+            yield (anchor[0]+sx, anchor[1]+sy, anchor[2]), (
+                box[0]+sx, box[1]+sy, box[2]+sx, box[3]+sy)
+
+
 def _hide(ann):
     ann.Visible = 3
     if optional(ann, "Visible") != 3:
@@ -163,9 +265,21 @@ def _hide(ann):
 
 
 def arrange_dimensions(doc, frame):
-    boxes = {get_value(view, "GetName2"): get_value(view, "GetOutline")[:4] for view in drawing_views(doc)}
-    reserved = format_zones(doc, frame)
-    blocked = (*boxes.values(), *reserved)
+    views = {get_value(view, "GetName2"): view for view in drawing_views(doc)}
+    boxes = {name: get_value(view, "GetOutline")[:4] for name, view in views.items()}
+    get_value(doc, "ViewZoomtofit2")
+    view_edges = {name: view_strokes(view, boxes[name]) for name, view in views.items()}
+    flat_views = {name for name, view in views.items() if optional(view, "IsFlatPatternView")}
+    model_edges = {name: view_edges[name]
+                   for name, view in views.items() if get_value(view, "Type") != 2
+                   and name not in flat_views}
+    outlines = {name: geometry_outline(view_edges[name], box) for name, box in boxes.items()}
+    reserved = list(format_zones(doc, frame))
+    for name, view in views.items():
+        for caption in section_captions(view):
+            box = _place_caption(caption, outlines[name], frame.drawable, outlines.values(), reserved)
+            if box is not None:
+                reserved.append(box)
     occupied = []
     seen = set()
     hidden = moved = 0
@@ -178,20 +292,23 @@ def arrange_dimensions(doc, frame):
         content, angle, text = text_geometry(item.annotation)
         family = optional(item.dimension, "GetSystemValue2", "") if item.dimension is not None else None
         kind = 2 if item.kind in (11, 12) else item.kind
-        key = (kind, round(family, 6), text) if isinstance(family, (int, float)) else None
-        rows.append((not driven, item.kind not in (5, 6), item, content, angle, key))
-    rows.sort(key=lambda row: row[:2])
-    for _, _, item, box, angle, key in rows:
+        own_name = get_value(item.view, "GetName2")
+        vertical = kind == 2 and (item.kind == 12 or (angle is not None and abs(cos(angle)) < .7))
+        key = (own_name, kind, round(family, 6), vertical, text) if isinstance(family, (int, float)) else None
+        rows.append((own_name in flat_views, not driven, item.kind not in (5, 6),
+                     item, content, angle, key, own_name))
+    rows.sort(key=lambda row: row[:3])
+    for _, _, _, item, box, angle, key, own_name in rows:
         if key in seen:
             _hide(item.annotation)
             hidden += 1
             continue
         used = [row[0] for row in occupied]
-        own_name = get_value(item.view, "GetName2")
         view = boxes[own_name]
         foreign = (*reserved, *(outline for name, outline in boxes.items() if name != own_name))
+        edges = model_edges.get(own_name, ())
         strokes = dimension_lines(item.annotation)
-        if (not fits(box, frame.drawable, blocked, used)
+        if (not _fits_detail(box, frame.drawable, foreign, used, view, edges)
                 or not _routes_fit(box, strokes, foreign, occupied)):
             anchor = optional(item.annotation, "GetPosition")
             if not anchor or len(anchor) < 3 or box is None:
@@ -199,17 +316,21 @@ def arrange_dimensions(doc, frame):
                 hidden += 1
                 continue
             max_length = max((dist(*line) for line in strokes), default=0.)
-            for position, predicted in candidates(anchor[:3], box, view, item.kind, angle):
-                if (not fits(predicted, frame.drawable, blocked, used)
+            outer = candidates(anchor[:3], box, view, item.kind, angle)
+            inner = _interior_candidates(anchor[:3], box, view) if edges else ()
+            options = (*inner, *outer) if intersects(box, view) else (*outer, *inner)
+            for position, predicted in options:
+                if (not _fits_detail(predicted, frame.drawable, foreign, used, view, edges)
                         or not _routes_fit(predicted, (), (), occupied)):
                     continue
                 if optional(item.annotation, "SetPosition2", *position) is False:
                     continue
                 placed, _, _ = text_geometry(item.annotation)
+                if not _fits_detail(placed, frame.drawable, foreign, used, view, edges):
+                    continue
                 moved_lines = dimension_lines(item.annotation)
                 longest = max((dist(*line) for line in moved_lines), default=0.)
                 if (longest <= max_length + .045
-                        and fits(placed, frame.drawable, blocked, used)
                         and _routes_fit(placed, moved_lines, foreign, occupied)):
                     box = placed
                     strokes = moved_lines

@@ -74,9 +74,12 @@ def view_slots(model, first_angle, flat):
     axes = sorted((i for i in range(3) if i != axis), key=lambda i: model.spans[i])
     side, other = axes
     side_sign = -1 if side == 0 else 1
-    if flat:
-        return (ViewSlot(side, side_sign, 0, 2), ViewSlot(axis, 1, 0, 1),
-                ViewSlot(axis, 1, 0, 0, "flat", factor=.5, align_right=True))
+    if model.sheet_metal:
+        offset = int(flat)
+        folded = (ViewSlot(side, side_sign, 0, 1+offset), ViewSlot(axis, 1, 0, offset))
+        if flat:
+            return (*folded, ViewSlot(axis, 1, 0, 0, "flat", factor=.5, align_right=True))
+        return folded
     if needs_reverse(model, axis):
         return (ViewSlot(axis, 1, 0, 0), ViewSlot(side, side_sign, 1, 0),
                 ViewSlot(axis, -1, 2, 0))

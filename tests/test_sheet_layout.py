@@ -4,8 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from gostinator.annotation_layout import _routes_fit, candidates, crosses, fits, format_zones, text_extent
+from gostinator.annotation_layout import (
+    _fits_detail, _polyline_strokes, _routes_fit, candidates, crosses, fits, format_zones, text_extent,
+)
 from gostinator.drawing_views import Frame
+from gostinator.title_block import _linked_notes, form_cells
 from gostinator.model_geometry import Bore, Model
 from gostinator.sheet_layout import Layout, PAPERS, choose_layout, configure_sheet
 
@@ -35,6 +38,15 @@ def test_flat_pattern_uses_a_separate_scale_and_row():
     assert layout.paper.name == "A4"
     assert layout.slots[-1].role == "flat" and layout.slots[-1].factor == .5
     assert len({y for _, y in layout.positions}) == 3
+
+
+def test_sheet_metal_uses_two_folded_views_if_blank_is_unavailable():
+    model = Model((0., 0., 0., .112, .043, .048), (), True)
+    layout = choose_layout(model, True, False)
+    upper, lower = layout.slots
+    assert upper.role == lower.role == "ordinary"
+    assert upper.axis != lower.axis and upper.column == lower.column
+    assert layout.positions[0][1] > layout.positions[1][1]
 
 
 def test_native_text_extent_respects_rotation_and_reserves_space():
@@ -89,3 +101,40 @@ def test_gost_format_reserves_the_upper_left_designation_cell():
     box = (.11, .405, .12, .41)
     assert not _routes_fit(box, (((.06, .405), (.11, .405)),), reserved, [])
     assert not fits((.04, .405, .055, .410), frame.drawable, reserved, ())
+
+
+@pytest.mark.parametrize("width", (.210, .594))
+def test_gost_text_cells_require_real_sheet_format_borders(width):
+    left, divider, right = width - .125, width - .055, width - .005
+    lines = (
+        ((left, .005), (left, .060)), ((divider, .045), (divider, .005)),
+        ((.020, .005), (right, .005)), ((left, .020), (right, .020)),
+        ((left, .045), (right, .045)),
+    )
+    assert form_cells(width, lines) == {
+        "name": (left, .020, divider, .045), "material": (left, .005, divider, .020),
+    }
+    assert set(form_cells(width, lines[:-1])) == {"material"}
+    assert not form_cells(width, lines[2:])
+
+
+def test_title_block_leaves_linked_notes_in_other_columns_alone():
+    inside = SimpleNamespace(GetPosition=(.120, .030, 0.))
+    outside = SimpleNamespace(GetPosition=(.190, .030, 0.))
+    notes = tuple(SimpleNamespace(PropertyLinkedText='$PRPSHEET:"Наименование"',
+                                  GetText="Название", GetAnnotation=annotation)
+                  for annotation in (inside, outside))
+    drawing = SimpleNamespace(GetFirstView=SimpleNamespace(GetNotes=notes))
+    assert _linked_notes(drawing, {"name": (.085, .020, .155, .045)}) == {"name": [inside]}
+
+
+def test_detail_label_uses_clear_space_inside_a_view_at_its_own_scale():
+    polyline = (0, 0, 0, 0, -1, 1, -1, 0, 2, 0, 0, 0, .02, 0, 0)
+    strokes = _polyline_strokes(polyline, (.06, .14, 2))
+    assert strokes == (((.06, .14), (.1, .14)),)
+    box = (.07, .151, .086, .155)
+    outline = (.04, .11, .13, .20)
+    assert _fits_detail(box, PAPERS[0].drawable, (), (), outline, strokes)
+    assert not _fits_detail(box, PAPERS[0].drawable, (), (), outline, ())
+    assert not _fits_detail((.07, .138, .086, .142), PAPERS[0].drawable, (), (), outline, strokes)
+    assert _polyline_strokes(polyline[:-1], (.06, .14, 2)) == ()

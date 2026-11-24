@@ -130,6 +130,8 @@ def create_views(doc, part, model, frame, layout=None):
         front.Angle = pi / 2
     get_value(doc, "EditRebuild3")
     for slot, position in zip(layout.slots[1:], layout.positions[1:]):
+        if slot.role == "flat":
+            continue
         scale = layout.scale * slot.factor
         if slot.role == "section":
             section = choose_section(model, primary.axis)
@@ -141,13 +143,6 @@ def create_views(doc, part, model, frame, layout=None):
                 cut = None
             if cut is None:
                 _create(doc, part, slot.axis, slot.sign, position, scale)
-        elif slot.role == "flat":
-            flat = get_value(doc, "CreateFlatPatternViewFromModelView3",
-                             str(part), "", *position, 0., False, False)
-            if flat is None or not get_value(flat, "IsFlatPatternView"):
-                raise RuntimeError("SolidWorks не подтвердил нативную развёртку")
-            flat.UseSheetScale = False
-            flat.ScaleDecimal = scale
         else:
             _create(doc, part, slot.axis, slot.sign, position, scale)
     get_value(doc, "EditRebuild3")
@@ -155,3 +150,16 @@ def create_views(doc, part, model, frame, layout=None):
     if not views:
         raise RuntimeError("После построения не найдено связанных видов")
     return [str(get_value(view, "GetName2")) for view in views]
+
+
+def create_flat_pattern(doc, part, layout):
+    slot = layout.slots[-1]
+    view = get_value(doc, "CreateFlatPatternViewFromModelView3",
+                     str(part), "", *layout.positions[-1], 0., False, False)
+    if view is None or not get_value(view, "IsFlatPatternView"):
+        raise RuntimeError("SolidWorks не подтвердил нативную развёртку")
+    view.UseSheetScale = False
+    view.ScaleDecimal = layout.scale * slot.factor
+    view.ShowSheetMetalBendNotes = False
+    get_value(doc, "EditRebuild3")
+    return str(get_value(view, "GetName2"))

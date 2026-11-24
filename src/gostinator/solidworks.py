@@ -17,6 +17,8 @@ SW_SAVE_CURRENT_VERSION = 0
 SW_SAVE_SILENT = 1
 SW_IMPORT_FROM_ENTIRE_MODEL = 0
 SW_DIMENSIONS_MARKED_FOR_DRAWING = 32768
+SW_DISPLAY_ORIGINS = 6
+SW_DISPLAY_COORD_SYSTEMS = 13
 _RAW_DISPATCH = TypeIIDs[IID_IDispatch]
 
 
@@ -120,6 +122,17 @@ def _save(drawing, target):
         raise RuntimeError(f"SolidWorks не сохранил {target.suffix} (код {result})")
 
 
+def _hide_reference_markers(drawing):
+    changed = False
+    for setting in (SW_DISPLAY_ORIGINS, SW_DISPLAY_COORD_SYSTEMS):
+        if get_value(drawing, "GetUserPreferenceToggle", setting):
+            if not get_value(drawing, "SetUserPreferenceToggle", setting, False):
+                raise RuntimeError("SolidWorks не скрыл обозначения координат на чертеже")
+            changed = True
+    if changed:
+        get_value(drawing, "GraphicsRedraw2")
+
+
 def convert_part(app, part, template, staging):
     """Generate native views and publishable files without reading the PDF."""
     from .model_geometry import read_model
@@ -164,11 +177,12 @@ class NativeDraftError(RuntimeError):
 def _generate_drawing(app, part, template, staging, model, *, writable_flat_source=None):
     from .annotation_layout import arrange_dimensions
     from .drawing_dimensions import add_dimensions, prune_model_dimensions
-    from .drawing_views import create_views, sheet_frame
+    from .drawing_views import create_flat_pattern, create_views, sheet_frame
     from .sheet_layout import (
         Layout, PAPERS, Paper, choose_layout, configure_sheet, installed_formats,
         synchronize_sheet_scale,
     )
+    from .title_block import fit_title_block
 
     target = staging / (uuid4().hex + ".SLDDRW")
     pdf = target.with_suffix(".pdf")
@@ -178,9 +192,9 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
     try:
         frame = sheet_frame(drawing)
         layout = None
+        include_flat = writable_flat_source is not None
         formats = installed_formats(app)
         if model is not None:
-            include_flat = writable_flat_source is not None
             if formats:
                 layout = choose_layout(model, frame.first_angle, include_flat,
                                        papers=tuple(p for p in PAPERS if p in formats))
@@ -203,8 +217,6 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
             views = create_views(drawing, part, model, frame, layout)
         except (AttributeError, RuntimeError, com_error) as exc:
             raise NativeDraftError(str(exc)) from exc
-        if views:
-            print(f"    Видов — {len(views)}", flush=True)
         if layout is not None:
             synchronize_sheet_scale(drawing, layout.scale)
         try:
@@ -212,6 +224,12 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
                       SW_DIMENSIONS_MARKED_FOR_DRAWING, True, False, False, False)
         except com_error as exc:
             print(f"[WARN] Не удалось импортировать размеры модели — {exc}", flush=True)
+        if include_flat:
+            # The flat blank must not take ownership of any imported model
+            # dimensions. Its envelope is dimensioned separately below.
+            views.append(create_flat_pattern(drawing, part, layout))
+        if views:
+            print(f"    Видов — {len(views)}", flush=True)
         if model is not None:
             try:
                 skipped = prune_model_dimensions(drawing)
@@ -228,6 +246,8 @@ def _generate_drawing(app, part, template, staging, model, *, writable_flat_sour
                 VARIANT(VT_BYREF | VT_I4, 0), VARIANT(VT_BYREF | VT_I4, 0)):
             raise RuntimeError("Не удалось сохранить конфигурацию развёртки")
         get_value(drawing, "ClearSelection2", True)
+        fit_title_block(drawing, frame)
+        _hide_reference_markers(drawing)
         _save(drawing, target)
         _save(drawing, pdf)
     finally:

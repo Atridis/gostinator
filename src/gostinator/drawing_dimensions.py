@@ -1,17 +1,19 @@
 """Select and dimension visible model geometry on the native drawing."""
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
-from math import dist, isclose, tau
+from math import acos, dist, isclose, tau
 
 from pythoncom import VT_DISPATCH, com_error
 from win32com.client import VARIANT
 
+from .annotation_layout import geometry_outline, view_strokes
 from .drawing_views import drawing_views, project, transform_of
 from .model_geometry import POSITION_TOLERANCE as TOLERANCE, axis_of, choose_section, primary_axis
 from .solidworks import as_dispatch, get_value
 
 
 LINEAR = 2
+ANGLE = 3
 RADIUS = 5
 DIAMETER = 6
 VISIBLE, HIDDEN = 1, 3
@@ -48,6 +50,7 @@ class Task:
     nominal: float
     direction: int
     projected: bool = False
+    overall: bool = False
 
 
 def _optional(obj, name, *args):
@@ -120,19 +123,32 @@ def _key(kind, value):
     return (LINEAR if kind in (11, 12) else kind, round(value / TOLERANCE))
 
 
-def _existing(views):
+def _existing(view):
     used = set()
-    for view in views:
-        for display in _optional(view, "GetDisplayDimensions") or ():
-            dimension = _optional(display, "GetDimension2", 0)
-            annotation = _optional(display, "GetAnnotation")
-            if dimension is None or annotation is None or _optional(annotation, "Visible") != VISIBLE:
-                continue
-            value = _optional(dimension, "GetSystemValue2", "")
-            kind = _optional(display, "Type2")
-            if kind is not None and isinstance(value, (int, float)):
-                used.add(_key(kind, value))
+    for display in _optional(view, "GetDisplayDimensions") or ():
+        dimension = _optional(display, "GetDimension2", 0)
+        annotation = _optional(display, "GetAnnotation")
+        if dimension is None or annotation is None or _optional(annotation, "Visible") != VISIBLE:
+            continue
+        value = _optional(dimension, "GetSystemValue2", "")
+        kind = _optional(display, "Type2")
+        if kind is not None and isinstance(value, (int, float)):
+            used.add(_key(kind, value))
     return used
+
+
+def _geometry_key(task, matrix, normal, view_scope=None):
+    kind, value = _key(task.kind, task.nominal)
+    world_axis = axis_of(matrix[task.direction:9:3]) if kind == LINEAR else None
+    if task.overall and world_axis is not None and view_scope is None:
+        extent = tuple(sorted(round(a.model[world_axis] / TOLERANCE) for a in task.targets))
+        return kind, value, world_axis, extent
+    # Opposite ordinary projections can show the same feature. Drop depth
+    # when comparing their projected attachment positions, but keep the
+    # measuring axis and the other coordinates of both attachments.
+    anchors = tuple(sorted(tuple(round(x / TOLERANCE) for i, x in enumerate(a.model)
+                                 if i != normal) for a in task.targets))
+    return view_scope, kind, value, normal, world_axis, anchors
 
 
 def prune_model_dimensions(doc):
@@ -176,7 +192,7 @@ def _pair_on_axis(anchors, at_low, at_high, direction, tolerance):
     return None
 
 
-def _overall_tasks(vertices, matrix):
+def _overall_tasks(vertices, matrix, *, minimum=.003):
     if not vertices:
         return
     scale = matrix[12]
@@ -184,17 +200,29 @@ def _overall_tasks(vertices, matrix):
     for direction in (0, 1):
         low = min(anchor.sheet[direction] for anchor in vertices)
         high = max(anchor.sheet[direction] for anchor in vertices)
-        if (high - low) / scale < .003:
+        if (high - low) / scale < minimum:
             continue
         pair = _pair_on_axis(vertices, low, high, direction, tolerance)
         if pair:
-            yield Task(pair, LINEAR, (high - low) / scale, direction)
+            yield Task(pair, LINEAR, (high - low) / scale, direction, overall=True)
             continue
         # An irregular stock profile can reach its two true limits at
         # staggered corners. Dimension the axis projection, not the diagonal.
         a = min(vertices, key=lambda anchor: anchor.sheet[direction])
         b = max(vertices, key=lambda anchor: anchor.sheet[direction])
-        yield Task((a, b), LINEAR, (high - low) / scale, direction, projected=True)
+        yield Task((a, b), LINEAR, (high - low) / scale, direction, projected=True, overall=True)
+
+
+def _blank_extent_tasks(vertices, matrix, contour):
+    if contour is None:
+        return
+    for task in _overall_tasks(vertices, matrix, minimum=TOLERANCE):
+        direction = task.direction
+        span = (contour[direction+2] - contour[direction]) / matrix[12]
+        # SolidWorks' drawing-view outline includes a margin. Compare the
+        # selected endpoints with the actual displayed blank contour instead.
+        if isclose(task.nominal, span, abs_tol=2*TOLERANCE, rel_tol=0.):
+            yield replace(task, projected=True)
 
 
 def _hole_tasks(circles, lines, model, view_axis, matrix):
@@ -376,7 +404,107 @@ def _aligned_width_tasks(lines, matrix):
         a, b = anchors
         width = abs(b.sheet[direction] - a.sheet[direction]) / scale
         if width >= .003:
-            yield Task((a, b), LINEAR, width, direction)
+            yield Task((a, b), LINEAR, width, direction, projected=True)
+
+
+def _stock_span_tasks(lines, matrix):
+    """Measure an internal boundary from a coplanar rail spanning the stock."""
+    if not lines:
+        return
+    scale = matrix[12]
+    tolerance = max(scale * TOLERANCE * 2, 1e-6)
+    limits = [(min(a.sheet[i] for line in lines for a in line.ends),
+               max(a.sheet[i] for line in lines for a in line.ends)) for i in (0, 1)]
+    groups = defaultdict(list)
+    for line in lines:
+        a, b = line.ends
+        dx, dy = (abs(a.sheet[i] - b.sheet[i]) for i in (0, 1))
+        along = int(dy > dx)
+        measure = 1 - along
+        level = a.sheet[measure]
+        lo, hi = limits[measure]
+        if (min(dx, dy) > tolerance or max(dx, dy) < .008 * scale
+                or abs(a.sheet[2] - b.sheet[2]) > tolerance
+                or not lo + tolerance < level < hi - tolerance):
+            continue
+        start, stop = sorted((a.sheet[along], b.sheet[along]))
+        midpoint = tuple((x + y) / 2 for x, y in zip(a.sheet, b.sheet))
+        anchor = Anchor(line.entity, a.model, midpoint, line.silhouette)
+        groups[along, round(a.sheet[2] / tolerance)].append((start, stop, level, anchor))
+
+    for (along, _), rails in groups.items():
+        lo, hi = limits[along]
+        full = [rail for rail in rails if abs(rail[0] - lo) <= tolerance and abs(rail[1] - hi) <= tolerance]
+        for start, stop, level, anchor in rails:
+            at_low = abs(start - lo) <= tolerance
+            at_high = abs(stop - hi) <= tolerance
+            if at_low == at_high:
+                continue
+            for _, _, base_level, datum in full:
+                width = abs(base_level - level) / scale
+                if width >= .004 and (stop-start) / scale >= .15 * width:
+                    yield Task((datum, anchor), LINEAR, width, 1 - along, projected=True)
+
+
+def _recess_tasks(lines, matrix):
+    """Dimension a symmetric recess bounded by a floor, two walls and rims."""
+    scale = matrix[12]
+    tolerance = max(scale * TOLERANCE, 1e-6)
+    joints = defaultdict(list)
+    planar = {}
+    for line in lines:
+        a, b = line.ends
+        if abs(a.sheet[2] - b.sheet[2]) > tolerance:
+            continue
+        ends = tuple(tuple(round(x / tolerance) for x in point.sheet) for point in (a, b))
+        key = tuple(sorted(ends))
+        if ends[0] == ends[1] or key in planar:
+            continue
+        planar[key] = line
+        for index, endpoint in enumerate(ends):
+            joints[endpoint].append((key, line.ends[1 - index]))
+
+    for key, floor in planar.items():
+        a, b = floor.ends
+        delta = [abs(a.sheet[i] - b.sheet[i]) for i in (0, 1)]
+        along = int(delta[1] > delta[0])
+        depth_axis = 1 - along
+        if delta[along] < .008 * scale or delta[depth_axis] > tolerance:
+            continue
+        sides = []
+        for sign, bottom in zip((-1, 1), sorted(floor.ends, key=lambda p: p.sheet[along])):
+            node = tuple(round(x / tolerance) for x in bottom.sheet)
+            options = []
+            for wall_key, rim in joints[node]:
+                if wall_key == key:
+                    continue
+                depth = rim.sheet[depth_axis] - bottom.sheet[depth_axis]
+                run = sign * (rim.sheet[along] - bottom.sheet[along])
+                if abs(depth) < .003 * scale or run < -tolerance:
+                    continue
+                rim_node = tuple(round(x / tolerance) for x in rim.sheet)
+                if any(other != wall_key
+                       and abs(end.sheet[depth_axis] - rim.sheet[depth_axis]) <= tolerance
+                       and sign * (end.sheet[along] - rim.sheet[along]) >= .004 * scale
+                       for other, end in joints[rim_node]):
+                    options.append((depth, run, bottom, rim, planar[wall_key]))
+            if len(options) != 1:
+                break
+            sides.extend(options)
+        if len(sides) != 2 or any(abs(a - b) > tolerance for a, b in zip(sides[0][:2], sides[1][:2])):
+            continue
+        depth, run, bottom, rim, first_wall = sides[0]
+        yield Task((bottom, rim), LINEAR, abs(depth) / scale, depth_axis, projected=True)
+        if run <= tolerance:
+            continue
+        yield Task(floor.ends, LINEAR, delta[along] / scale, along)
+        angle = acos((depth*depth - run*run) / (depth*depth + run*run))
+        if .20 < angle < 2.95:
+            walls = (first_wall, sides[1][4])
+            anchors = tuple(Anchor(line.entity, line.ends[0].model,
+                                   tuple((a + b) / 2 for a, b in zip(*(p.sheet for p in line.ends))))
+                            for line in walls)
+            yield Task(anchors, ANGLE, angle, along)
 
 
 def _section_frame(vertices, model, normal, matrix, box):
@@ -626,46 +754,61 @@ def _discard(doc, view, display, annotation):
 def add_dimensions(doc, model, frame):
     if model is None:
         return 0
-    views = drawing_views(doc)
-    existing = _existing(views)
+    views = [(view, bool(_optional(view, "IsFlatPatternView"))) for view in drawing_views(doc)]
+    views.sort(key=lambda item: item[1])
+    if any(flat for _, flat in views):
+        get_value(doc, "ViewZoomtofit2")
+    created_geometry = set()
     # These generated labels get their lanes first. Imported labels will be
     # moved around them by the native text layout after dimensioning.
     text = []
-    boxes = [tuple(get_value(view, "GetOutline")[:4]) for view in views]
+    boxes = [tuple(get_value(view, "GetOutline")[:4]) for view, _ in views]
     added = 0
-    for view, box in zip(views, boxes):
+    for (view, flat), box in zip(views, boxes):
         matrix = transform_of(view)
         normal = axis_of(matrix[2:9:3])
-        if normal is None:
+        if normal is None and not flat:
             continue
         vertices, circles, lines = _anchors(view, matrix)
         section = get_value(view, "Type") == 2
+        view_scope = get_value(view, "GetName2") if section or flat else None
+        imported = _existing(view)
+        created_in_view = set()
         if section:
             matrix, shift = _section_frame(vertices, model, normal, matrix, box)
             def reproject(anchor):
                 return replace(anchor, sheet=project(anchor.model, matrix))
             vertices = [reproject(vertex) for vertex in vertices]
             lines = [replace(line, ends=tuple(map(reproject, line.ends))) for line in lines]
-        tasks = list(_overall_tasks(vertices, matrix))
-        if section:
-            cut_lines = lines + list(_section_silhouettes(view, matrix))
-            tasks.extend(_section_tasks(vertices, cut_lines, model, normal, matrix, shift))
+        if flat:
+            contour = geometry_outline(view_strokes(view, box), None)
+            tasks = _blank_extent_tasks(vertices, matrix, contour)
         else:
-            tasks.extend(_hole_tasks(circles, lines, model, normal, matrix))
-            tasks.extend(_profile_radii(circles, lines, vertices, normal, matrix))
-        tasks.extend(_corner_cut_tasks(lines, matrix))
-        tasks.extend(_profile_tasks(lines, matrix))
-        tasks.extend(_aligned_width_tasks(lines, matrix))
+            tasks = list(_overall_tasks(vertices, matrix))
+            if section:
+                cut_lines = lines + list(_section_silhouettes(view, matrix))
+                tasks.extend(_section_tasks(vertices, cut_lines, model, normal, matrix, shift))
+            else:
+                tasks.extend(_recess_tasks(lines, matrix))
+                tasks.extend(_stock_span_tasks(lines, matrix))
+                tasks.extend(_hole_tasks(circles, lines, model, normal, matrix))
+                tasks.extend(_profile_radii(circles, lines, vertices, normal, matrix))
+            tasks.extend(_corner_cut_tasks(lines, matrix))
+            tasks.extend(_profile_tasks(lines, matrix))
+            tasks.extend(_aligned_width_tasks(lines, matrix))
         for task in tasks:
             key = _key(task.kind, task.nominal)
-            if key in existing:
+            local = (key, task.direction if task.kind == LINEAR else None)
+            geometry = _geometry_key(task, matrix, normal, view_scope)
+            if key in imported or local in created_in_view or geometry in created_geometry:
                 continue
             position = _label(task, box, boxes, text, frame)
             if position is None:
                 continue
             if _create(doc, view, task, position, matrix):
                 added += 1
-                existing.add(key)
+                created_in_view.add(local)
+                created_geometry.add(geometry)
                 text.append(position)
         get_value(doc, "ClearSelection2", True)
     return added

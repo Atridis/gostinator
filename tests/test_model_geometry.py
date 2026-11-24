@@ -1,9 +1,11 @@
+from math import pi
 from types import SimpleNamespace
 
 import pytest
 
 from gostinator.drawing_dimensions import (
-    Anchor, Line, _corner_cut_tasks, _overall_tasks, _section_frame, _select_section_edge,
+    Anchor, Line, Task, _blank_extent_tasks, _corner_cut_tasks, _geometry_key, _overall_tasks, _recess_tasks,
+    _section_frame, _select_section_edge, _stock_span_tasks,
 )
 from gostinator.drawing_views import project
 from gostinator.model_geometry import Bore, Model, _read_cylinders, choose_section, needs_reverse, primary_axis
@@ -76,6 +78,33 @@ def test_overall_dimension_uses_axis_projection_for_staggered_vertices():
     assert list(_overall_tasks([a, b, c], matrix))[0].nominal == pytest.approx(.05)
 
 
+def test_blank_dimensions_only_cover_the_confirmed_contour_extents():
+    matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, .5, 0, 0, 0)
+    points = ((0., 0., 0.), (.080, 0., 0.), (.080, .040, 0.), (0., .040, 0.))
+    anchors = [Anchor(object(), point, project(point, matrix)) for point in points]
+    assert not list(_blank_extent_tasks(anchors, matrix, None))
+    tasks = list(_blank_extent_tasks(anchors, matrix, (0., 0., .040, .020)))
+    assert [task.nominal for task in tasks] == pytest.approx([.080, .040])
+    assert all(task.overall and task.projected for task in tasks)
+    task, = _blank_extent_tasks(anchors, matrix, (0., 0., .042, .020))
+    assert task.direction == 1  # the vertices don't reach the full width
+
+
+def test_opposite_views_deduplicate_the_same_span_but_keep_an_independent_span():
+    front = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+    back = (-1, 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0)
+
+    def measure(y, z):
+        a = Anchor(object(), (.01, y, z), (.01, y, z))
+        b = Anchor(object(), (.03, y, z), (.03, y, z))
+        return Task((a, b), 2, .02, 0)
+
+    original = _geometry_key(measure(.02, .01), front, 2)
+    assert original == _geometry_key(measure(.02, 0), back, 2)
+    assert original != _geometry_key(measure(.03, 0), back, 2)
+    assert original != _geometry_key(measure(.02, 0), back, 2, "Flat pattern")
+
+
 def test_corner_cutback_needs_two_perpendicular_incident_rails():
     matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
     a = Anchor(object(), (0., .01, 0.), (0., .01, 0.))
@@ -89,6 +118,38 @@ def test_corner_cutback_needs_two_perpendicular_incident_rails():
     tasks = list(_corner_cut_tasks((diagonal, vertical, horizontal), matrix))
     assert [task.nominal for task in tasks] == pytest.approx([.012, .01])
     assert all(task.projected for task in tasks)
+
+
+def test_symmetric_recess_uses_floor_wall_and_rim_connections():
+    matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+    coordinates = [(0., .01, 0.), (.01, .01, 0.), (.02, 0., 0.),
+                   (.04, 0., 0.), (.05, .01, 0.), (.06, .01, 0.)]
+    anchors = [Anchor(object(), point, point) for point in coordinates]
+    lines = [Line(object(), (a, b)) for a, b in zip(anchors, anchors[1:])]
+    assert not list(_recess_tasks(lines[:-1], matrix))
+    tasks = list(_recess_tasks(lines, matrix))
+    assert [task.kind for task in tasks] == [2, 2, 3]
+    assert [task.nominal for task in tasks] == pytest.approx([.01, .02, pi/2])
+    assert tasks[0].targets == (anchors[2], anchors[1])
+    assert [a.entity for a in tasks[2].targets] == [lines[1].entity, lines[3].entity]
+
+
+def test_stock_span_requires_an_inner_coplanar_boundary_at_the_same_end():
+    matrix = (1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0)
+
+    def rail(y, start, end, z=0.):
+        points = ((start, y, z), (end, y, z))
+        return Line(object(), tuple(Anchor(object(), p, p) for p in points))
+
+    bottom = rail(0., 0., .06)
+    datum = rail(.02, 0., .06)
+    partial = rail(.04, 0., .035)
+    unrelated = rail(.07, 0., .04, z=.01)
+    top = rail(.08, 0., .06)
+    task, = _stock_span_tasks((bottom, datum, partial, unrelated, top), matrix)
+    assert task.kind == 2 and task.direction == 1 and task.projected
+    assert task.nominal == pytest.approx(.02)
+    assert [a.entity for a in task.targets] == [datum.entity, partial.entity]
 
 
 def test_section_hit_must_match_the_selected_curve_and_view():
