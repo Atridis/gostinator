@@ -283,6 +283,30 @@ def test_radius_move_keeps_the_arrow_on_the_visible_arc():
     assert any(_distance_to_stroke(points[1], edge) <= tolerance for edge in visible)
     assert all(_distance_to_stroke((.01, -.003), edge) > tolerance for edge in visible)
 
+    angle = -pi/12
+    projected = (.010*cos(angle), .010*sin(angle), 0., cos(angle), sin(angle), 0.)
+    assert _radius_arc(projected, .010, (*arc, tangent))[0] == ()
+    assert _radius_arc(projected, .010, (*arc, tangent), allow_extension=True)[0] == arc
+
+
+def test_radius_leader_distinguishes_parallel_stray_stroke_from_a_normal_shelf():
+    arrow = (.110, .100, 0., 1., 0.)
+    center = ((.100, .100), (.110, .100))
+    outward = ((.110, .100), (.117, .100))
+    shelf = ((.117, .100), (.125, .100))
+    stray = ((.110, .101), (.125, .101))
+
+    detect = annotation_layout._doubled_radius_leader
+    assert not detect(arrow, .010, (center, outward, shelf))
+    assert detect(arrow, .010, (center, outward, shelf, stray))
+
+
+def test_radius_arrow_can_land_between_coarse_chord_endpoints():
+    arc = (((.008, 0.), (0., .008)),)
+    a = pi/4
+    arrow = (.008*cos(a), .008*sin(a), 0., cos(a), sin(a), 0.)
+    assert _radius_arc(arrow, .008, arc)[0] == arc
+
 
 def test_gost_format_reserves_the_upper_left_designation_cell():
     sheet = SimpleNamespace(GetTemplateName="a2 - gost_sh1.slddrt")

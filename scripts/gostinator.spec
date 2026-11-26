@@ -3,7 +3,8 @@ from pathlib import Path
 import sys
 import tkinter
 
-source = Path(SPECPATH).parent / "src"
+project = Path(SPECPATH).parent
+source = project / "src"
 
 def build_program(name, entry, *, console, datas=(), hookspath=(), excludes=()):
     analysis = Analysis(
@@ -27,6 +28,6 @@ for library, version in (("tcl", tkinter.TclVersion), ("tk", tkinter.TkVersion))
     if folder.is_dir():
         tk_data.append((str(folder), f"_{library}_data"))
 gui = build_program(
-    "gostinator-ui", "ui.py", console=False, datas=tk_data,
+    "gostinator-ui", "ui.py", console=False, datas=[*tk_data, (str(project / "pyproject.toml"), ".")],
     hookspath=[str(Path(SPECPATH) / "hooks")] if len(tk_data) == 2 else [],
 )

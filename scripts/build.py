@@ -51,9 +51,11 @@ def smoke(output: Path):
         bundled = {name.replace(chr(92), "/").lower() for name in executable.toc}
         required = {"pywin32_system32/pythoncom312.dll", "pywin32_system32/pywintypes312.dll"}
         if program == gui:
-            required.update({"ui", "_tkinter.pyd", "_tcl_data/init.tcl", "_tk_data/tk.tcl"})
+            required.update({"ui", "_tkinter.pyd", "_tcl_data/init.tcl", "_tk_data/tk.tcl", "pyproject.toml"})
         if missing := required - bundled:
             raise RuntimeError(f"{program.name} is missing {', '.join(sorted(missing))}")
+        if program == gui and executable.extract("pyproject.toml") != (ROOT / "pyproject.toml").read_bytes():
+            raise RuntimeError(f"{program.name} contains different project metadata than the build")
         python_modules = executable.open_embedded_archive("PYZ.pyz").toc
         roots = {name.split("/")[0].split(".")[0] for name in bundled}
         roots.update(name.split(".")[0].lower() for name in python_modules)

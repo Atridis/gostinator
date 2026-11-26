@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from importlib.metadata import version
 from pathlib import Path
 from queue import Empty, Queue
+import sys
 from threading import Thread
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import tomllib
 
 from gostinator.cli import run_batch
 
@@ -17,6 +20,17 @@ DIRECTORY_EDITS = {
     ord("V"): ("Вставить", "<<Paste>>"),
     ord("A"): ("Выделить всё", "<<SelectAll>>"),
 }
+
+
+def project_version():
+    if getattr(sys, "frozen", False):
+        config = Path(sys._MEIPASS) / "pyproject.toml"
+    else:
+        config = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if not config.is_file():
+            return version("gostinator")
+    with config.open("rb") as project:
+        return tomllib.load(project)["project"]["version"]
 
 
 def path_text(variable):
@@ -48,7 +62,7 @@ class GostinatorWindow:
         self.parts = tk.StringVar(value=str(Path.cwd() / "in"))
         self.output = tk.StringVar(value=str(Path.cwd() / "out"))
 
-        root.title("Gostinator")
+        root.title(f"Gostinator-{project_version()}")
         root.minsize(610, 480)
         root.geometry("750x570")
         root.configure(background="#f5f7fa")
@@ -59,7 +73,6 @@ class GostinatorWindow:
         style.theme_use("clam")
         style.configure("TFrame", background="#f5f7fa")
         style.configure("TLabel", background="#f5f7fa", foreground="#172438")
-        style.configure("Heading.TLabel", font=("Segoe UI", 20, "bold"))
         style.configure("Status.TLabel", foreground="#43556b")
         style.configure("Run.TButton", background="#184f9a", foreground="white",
                         padding=(16, 7), font=("Segoe UI", 10, "bold"))
@@ -70,22 +83,21 @@ class GostinatorWindow:
         content = ttk.Frame(root, padding=(25, 18))
         content.pack(expand=True, fill="both")
         content.columnconfigure(0, weight=1)
-        content.rowconfigure(6, weight=1)
-        ttk.Label(content, text="Gostinator", style="Heading.TLabel").grid(row=0, sticky="w", pady=(0, 12))
-        self.directory_field(content, 1, "Папка моделей SolidWorks", self.parts)
-        self.directory_field(content, 2, "Папка результатов", self.output)
+        content.rowconfigure(5, weight=1)
+        self.directory_field(content, 0, "Папка моделей SolidWorks", self.parts)
+        self.directory_field(content, 1, "Папка результатов", self.output)
 
         actions = ttk.Frame(content)
-        actions.grid(row=3, sticky="ew", pady=(1, 12))
+        actions.grid(row=2, sticky="ew", pady=(1, 12))
         self.run_button = ttk.Button(actions, text="Создать чертежи", style="Run.TButton", command=self.start)
         self.run_button.pack(side="left")
 
         self.progress = ttk.Progressbar(content, mode="determinate", maximum=1)
-        self.progress.grid(row=4, sticky="ew")
-        ttk.Label(content, textvariable=self.status, style="Status.TLabel").grid(row=5, sticky="w", pady=(4, 11))
+        self.progress.grid(row=3, sticky="ew")
+        ttk.Label(content, textvariable=self.status, style="Status.TLabel").grid(row=4, sticky="w", pady=(4, 11))
 
         log_frame = ttk.LabelFrame(content, text="Журнал", padding=(8, 5))
-        log_frame.grid(row=6, sticky="nsew")
+        log_frame.grid(row=5, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame)
         scrollbar.pack(side="right", fill="y")
         self.log = tk.Text(log_frame, wrap="word", state="disabled", height=8, borderwidth=0,

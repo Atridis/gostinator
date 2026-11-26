@@ -2,7 +2,7 @@
 from collections import defaultdict, namedtuple
 from dataclasses import dataclass, replace
 from itertools import chain, islice
-from math import cos, dist, hypot, isclose, isfinite, sin
+from math import cos, dist, hypot, isclose, isfinite, sin, tau
 from pathlib import Path
 from re import sub
 
@@ -237,18 +237,28 @@ def _leader_hits(segment, obstacle, center, radius):
     return 0. <= t <= 1. and 0. <= s <= 1. and dist((a[0]+t*x, a[1]+t*y), center) > radius
 
 
-def _clear_leader(strokes, obstacles, center, radius):
-    return bool(strokes) and not any(
-        _leader_hits(line, edge, center, radius) for line in strokes for edge in obstacles)
+def _clear_leader(strokes, obstacles, center, radius, *, border=()):
+    if not strokes:
+        return False
+    hits = ((line, edge) for line in strokes for edge in obstacles if _leader_hits(line, edge, center, radius))
+    first = next(hits, None)
+    if first is None:
+        return True
+    line, edge = first
+    return edge in border and _line_crossings((line,), (edge,)) == 1 and next(hits, None) is None
 
 
-def _leader_positions(anchors, width, height, allowed, own, foreign, used, obstacles):
+def _leader_positions(anchors, width, height, allowed, own, foreign, used, obstacles, *, border=(), refine=False):
     proposals = []
     diagonal = .7071067812
     directions = ((1., 0.), (-1., 0.), (0., 1.), (0., -1.), (diagonal, diagonal),
                   (-diagonal, diagonal), (diagonal, -diagonal), (-diagonal, -diagonal))
+    reaches = (.006, .010, .015, .021, .029, .040)
+    if refine:
+        directions = tuple((cos(step*tau/48), sin(step*tau/48)) for step in range(48))
+        reaches = (.004, .006, .008, .010, .012, .015, .018, .021, .024, .029, .034, .040)
     for anchor, center, radius in anchors:
-        for reach in (.006, .010, .015, .021, .029, .040):
+        for reach in reaches:
             for dx, dy in directions:
                 tip = (center[0]+dx*radius, center[1]+dy*radius)
                 elbow = (tip[0]+dx*reach, tip[1]+dy*reach)
@@ -260,11 +270,12 @@ def _leader_positions(anchors, width, height, allowed, own, foreign, used, obsta
                     continue
                 if any(crosses(edge, box) for edge in obstacles):
                     continue
-                if not _clear_leader(((tip, elbow),), obstacles, center, radius+.0004):
+                outside = not intersects(box, own)
+                if not _clear_leader(((tip, elbow),), obstacles, center, radius+.0004,
+                                     border=border if outside else ()):
                     continue
                 if any(crosses((tip, elbow), used_box) for used_box in used):
                     continue
-                outside = not intersects(box, own)
                 proposals.append((outside, reach, anchor, (x, y), center, radius))
     return sorted(proposals, key=lambda row: row[:2])
 
@@ -688,7 +699,15 @@ def _distance_to_stroke(point, stroke):
     return dist(point, (x0+fraction*dx, y0+fraction*dy))
 
 
-def _radius_arc(arrow, radius, geometry):
+def _in_arc_span(point, center, stroke):
+    # Exported polylines can approximate a bend with only a few chords.
+    # Compare the arrow's angle to the endpoints rather than its distance to a chord.
+    (ax, ay), (bx, by), (px, py) = ((x-center[0], y-center[1]) for x, y in (*stroke, point))
+    turn = ax*by-ay*bx
+    return abs(turn) > 1e-12 and turn*(ax*py-ay*px) >= 0. and turn*(px*by-py*bx) >= 0.
+
+
+def _radius_arc(arrow, radius, geometry, *, allow_extension=False):
     if arrow is None or radius <= 0 or (direction := hypot(*arrow[3:5])) < .99:
         return (), 0.
     point = arrow[:2]
@@ -696,12 +715,42 @@ def _radius_arc(arrow, radius, geometry):
     tolerance = max(.0001, min(.0004, radius*.02))
     # SolidWorks can put a radial arrow on the extension of the supporting
     # circle. Verify the original visible arc rather than the infinite circle.
+    closest = (), float("inf")
     for center in ((point[0]+dx, point[1]+dy), (point[0]-dx, point[1]-dy)):
         arc = tuple(stroke for stroke in geometry
                     if all(abs(dist(end, center)-radius) <= tolerance for end in stroke))
-        if any(_distance_to_stroke(point, stroke) <= tolerance for stroke in arc):
+        if any(_in_arc_span(point, center, stroke) for stroke in arc):
             return arc, tolerance
-    return (), tolerance
+        gap = min((_distance_to_stroke(point, stroke) for stroke in arc), default=float("inf"))
+        if gap < closest[1]:
+            closest = arc, gap
+    arc, gap = closest
+    return (arc if allow_extension or gap <= tolerance else ()), tolerance
+
+
+def _doubled_radius_leader(arrow, radius, strokes):
+    if arrow is None or radius <= 0:
+        return False
+    x, y = arrow[:2]
+    dx, dy = arrow[3:5]
+    branches = []
+    for stroke in strokes:
+        if min(dist((x, y), p) for p in stroke) > min(.003, .25*radius):
+            continue
+        a, b = sorted(((px-x)*dx+(py-y)*dy, (py-y)*dx-(px-x)*dy) for px, py in stroke)
+        length = b[0]-a[0]
+        if length > .002 and abs(b[1]-a[1]) < .65*length:
+            branches.append((a, b, (b[1]-a[1])/length))
+    # The outward strokes overlap along the arrow direction but run beside
+    # one another. The line to the center and the text shelf meet end to end.
+    for index, (a, b, slope) in enumerate(branches):
+        for c, d, other_slope in branches[index+1:]:
+            low, high = max(a[0], c[0]), min(b[0], d[0])
+            if high-low > .001 and any(abs((a[1]+(t-a[0])*slope) -
+                                           (c[1]+(t-c[0])*other_slope)) > .00015
+                                       for t in (low, high)):
+                return True
+    return False
 
 
 def _doubled_diameter_leader(item, strokes):
@@ -735,20 +784,31 @@ def _spread_callouts(placed, occupied, outlines, edges, reserved, allowed):
             continue
         own = outlines[name]
         box, strokes = occupied[index]
-        if not strokes or intersects(box, own):
+        if not strokes:
             continue
         others = occupied[:index] + occupied[index+1:]
         used = [label for label, _ in others]
         score, count = _callout_crowding(box, used)
-        doubled = _doubled_diameter_leader(item, strokes)
-        if not doubled and (count < 2 or score < .25):
+        if item.kind == 5:
+            value = optional(item.dimension, "GetSystemValue2", "")
+            scale = optional(item.view, "ScaleDecimal")
+            radius = (value or 0.)*(scale or 0.)
+            arrow = _single_arrow(item)
+            doubled = _doubled_radius_leader(arrow, radius, strokes)
+        else:
+            doubled = _doubled_diameter_leader(item, strokes)
+        if not doubled and (intersects(box, own) or count < 2 or score < .25):
             continue
         foreign = (*reserved, *(outline for owner, outline in outlines.items() if owner != name))
         options = _callout_positions(box, own, allowed, foreign, used,
                                      float("inf") if doubled else score)
         if doubled:
-            nearby = [(0., dx, dy) for delta in (.004, -.004, .006, -.006, .008, -.008, .014, -.014)
+            steps = (.004, -.004, .006, -.006, .008, -.008, .014, -.014)
+            nearby = [(0., dx, dy) for delta in steps
                       for dx, dy in ((0., delta), (delta, 0.))]
+            if item.kind == 5:
+                shifts = (-.002, .002, -.004, .004, -.008, .008, -.012, .012, -.016, .016)
+                nearby.extend((0., dx, dy) for dx in shifts for dy in steps)
             options = nearby + options
         if not options:
             continue
@@ -758,9 +818,7 @@ def _spread_callouts(placed, occupied, outlines, edges, reserved, allowed):
         neighboring_lines = tuple(line for _, lines in others for line in lines)
         geometry = edges.get(name, ())
         if item.kind == 5:
-            radius = optional(item.dimension, "GetSystemValue2", "")
-            scale = optional(item.view, "ScaleDecimal")
-            arc, tolerance = _radius_arc(_single_arrow(item), (radius or 0.)*(scale or 0.), geometry)
+            arc, _ = _radius_arc(arrow, radius, geometry, allow_extension=doubled)
             if not arc:
                 continue
         crossings = _line_crossings(strokes, neighboring_lines)
@@ -775,7 +833,8 @@ def _spread_callouts(placed, occupied, outlines, edges, reserved, allowed):
             lines = dimension_lines(item.annotation)
             if item.kind == 5:
                 arrow = _single_arrow(item)
-                if arrow is None or not any(_distance_to_stroke(arrow[:2], stroke) <= tolerance for stroke in arc):
+                if (arrow is None or _doubled_radius_leader(arrow, radius, lines)
+                        or not _radius_arc(arrow, radius, arc)[0]):
                     continue
             if (fits(actual, allowed, (own, *foreign), used) and lines
                     and (doubled or _callout_crowding(actual, used)[0] < score-.12)
@@ -925,7 +984,11 @@ class DimensionTextLayout:
 
     @staticmethod
     def _key(view, annotation):
-        return get_value(view, "GetName2"), get_value(annotation, "GetName")
+        display = optional(annotation, "GetSpecificAnnotation")
+        dimension = optional(display, "GetDimension2", 0) if display is not None else None
+        # Imported dimensions in different model features can both be named D2.
+        full_name = optional(dimension, "FullName") if dimension is not None else None
+        return get_value(view, "GetName2"), full_name or get_value(annotation, "GetName")
 
     def place(self, view, annotation, kind):
         key = self._key(view, annotation)
@@ -960,9 +1023,11 @@ class DimensionTextLayout:
         optional(annotation, "SetPosition2", *origin)
         return False
 
-    def free_diameter_routes(self, view, original, anchors, label_size, centerlines):
+    def free_diameter_routes(self, view, original, anchors, label_size, centerlines, *,
+                             used_centers=(), allow_outline_exit=False, refine=False):
         """Suggest short routes, then check the geometry actually drawn by SolidWorks."""
-        name, _ = key = self._key(view, original)
+        name = get_value(view, "GetName2")
+        key = self._key(view, original) if original is not None else None
         edges = self.edges.get(name, ())
         if not edges:  # No reliable way to check the leader against this view.
             return
@@ -970,16 +1035,32 @@ class DimensionTextLayout:
         boxes = [box for box, _ in occupied]
         foreign = (*self.reserved, *(box for other, box in self.boxes.items() if other != name))
         obstacles = tuple(chain(edges, centerlines, *(lines for _, lines in occupied)))
-        proposals = _leader_positions(anchors, *label_size, self.frame, self.boxes[name],
-                                      foreign, boxes, obstacles)
-
+        own = self.boxes[name]
+        border = ()
+        if allow_outline_exit:
+            own = geometry_outline(edges, own)
+            # Permit one exit through a straight exterior edge. Inner edges,
+            # centerlines, and other annotations are still obstacles.
+            border = tuple(edge for edge in edges if any(
+                all(abs(p[axis]-own[bound]) <= .0001 for p in edge)
+                for bound, axis in enumerate((0, 1, 0, 1))))
         def accept(annotation, center, radius):
             box = text_geometry(annotation)[0]
             strokes = dimension_lines(annotation)
             return (fits(box, self.frame, foreign, boxes)
                     and not any(crosses(edge, box) for edge in obstacles)
                     and _routes_fit(box, strokes, foreign, occupied)
-                    and _clear_leader(strokes, obstacles, center, radius+.0004))
+                    and _clear_leader(strokes, obstacles, center, radius+.0004,
+                                      border=border if not intersects(box, own) else ()))
 
-        for _, _, anchor, position, center, radius in islice(proposals, 24):
-            yield anchor, position, center, radius, accept
+        for fine in ((False, True) if refine else (False,)):
+            proposals = _leader_positions(anchors, *label_size, self.frame, own,
+                                          foreign, boxes, obstacles, border=border, refine=fine)
+            if used_centers:
+                free = (route for route in proposals if route[4] not in used_centers)
+                used = (route for route in proposals if route[4] in used_centers)
+                candidates = chain(islice(free, 24), islice(used, 24))
+            else:
+                candidates = islice(proposals, 24)
+            for _, _, anchor, position, center, radius in candidates:
+                yield anchor, position, center, radius, accept

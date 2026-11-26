@@ -4,16 +4,25 @@ from dataclasses import dataclass
 from math import atan2, cos, dist, isclose, sin, tau
 from re import fullmatch
 
-from pythoncom import VT_DISPATCH
+from pythoncom import VT_DISPATCH, com_error
 from win32com.client import VARIANT
 
-from .annotation_layout import DimensionTextLayout, dimension_lines, text_geometry
+from .annotation_layout import DimensionTextLayout, _line_crossings, dimension_lines, text_geometry
 from .drawing_dimensions import (
-    Circle, DIAMETER, Task, _create, _discard, _hide, _optional, _plain_diameter, _projected_bore,
+    Circle, DIAMETER, Task, VISIBLE, _create, _discard, _hide, _optional, _plain_diameter, _projected_bore,
 )
 from .drawing_views import add_view_centerlines, project
-from .model_geometry import POSITION_TOLERANCE as TOLERANCE, axis_of
+from .model_geometry import Bore, POSITION_TOLERANCE as TOLERANCE, axis_of
 from .solidworks import as_dispatch, get_value
+
+
+@dataclass(frozen=True)
+class ThreadSpec:
+    size: str
+    diameter: int | None
+    depth: int | None
+    fit: str | None
+    tap_drill: int | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +33,7 @@ class Hole:
     profile: tuple
     thread: str = ""
     edges: tuple[Circle, ...] = ()
+    tap_drill: Bore | None = None
 
 
 def _stations(values):
@@ -54,9 +64,13 @@ def _thread_centers(view):
                 size = next((word for word in source.split() if fullmatch(r"[MМ]\d+(?:[.,]\d+)?", word)), "")
             depth = _optional(wizard, "ThreadDepth") if wizard is not None else None
             fit = _optional(wizard, "ThreadClass") if wizard is not None else None
-            spec = (_thread_name(size) if isinstance(size, str) else "",
-                    round(diameter/TOLERANCE) if isinstance(diameter, (float, int)) else None,
-                    round(depth/TOLERANCE) if isinstance(depth, (float, int)) else None, fit)
+            drill_sizes = {round(value/TOLERANCE) for prop in ("TapDrillDiameter", "ThruTapDrillDiameter")
+                           if wizard is not None and isinstance(value := _optional(wizard, prop), (float, int))
+                           and value > TOLERANCE}
+            spec = ThreadSpec(_thread_name(size) if isinstance(size, str) else "",
+                              round(diameter/TOLERANCE) if isinstance(diameter, (float, int)) else None,
+                              round(depth/TOLERANCE) if isinstance(depth, (float, int)) else None, fit,
+                              next(iter(drill_sizes)) if len(drill_sizes) == 1 else None)
             data = _optional(annotation, "GetDisplayData")
             count = (_optional(data, "GetArcCount") or 0) if data is not None else 0
             for index in range(count):
@@ -99,9 +113,12 @@ def projected_holes(circles, model, matrix, threads=()):
         profile = tuple(sorted({_stations((b.radius, b.low, b.high)) for b in bores}))
         visible_rings = tuple(sorted({_stations((c.radius, c.anchor.model[normal])) for c in candidates
                                       if c.fraction >= .80}))
-        thread_profile = sources[0] if len(set(sources)) == 1 else ("", None, None, None)
+        thread_profile = sources[0] if len(set(sources)) == 1 else None
+        thread = thread_profile.size if thread_profile is not None else ""
+        tap_drills = [bore for bore in bores if thread and thread_profile.tap_drill is not None
+                      and abs(2*bore.radius-thread_profile.tap_drill*TOLERANCE) <= TOLERANCE]
         result.append(Hole(center, rim, tuple(bores), (profile, visible_rings, tuple(sorted(set(sources), key=str))),
-                           thread_profile[0], tuple(matched)))
+                           thread, tuple(matched), tap_drills[0] if len(tap_drills) == 1 else None))
     return tuple(result)
 
 
@@ -293,58 +310,156 @@ def _centerline_strokes(holes, scale):
         yield (x, y-span), (x, y+span)
 
 
-def _relocate_group_diameter(doc, layout, item, group, bore, matrix, holes):
+def _is_stepped(group, bore):
+    return any(abs(part.radius-bore.radius) > TOLERANCE for part in group[0].bores)
+
+
+def _arrows_span_hole(annotation, center, radius):
+    data = _optional(annotation, "GetDisplayData")
+    if _optional(data, "GetArrowHeadCount") != 2:
+        return False
+    tips = [_optional(data, "GetArrowHeadAtIndex2", index) for index in range(2)]
+    if not all(tip and len(tip) >= 2 for tip in tips):
+        return False
+    a, b = (tip[:2] for tip in tips)
+    midpoint = tuple((x+y)/2 for x, y in zip(a, b))
+    return dist(midpoint, center) <= .00015 and abs(dist(a, b)-2*radius) <= .00015
+
+
+def _route_group_diameter(doc, layout, view, item, group, bore, matrix, holes, *, used_centers, thread=""):
     # All candidates belong to the very same verified hole family. Keep
     # the diameter associative by selecting a visible edge of that bore.
     members = _covered_bores(group, bore)
     scale = matrix[12]
     anchors = []
     for hole in group:
-        edges = [edge for edge in hole.edges if any(
-            abs(edge.radius-member.radius) <= TOLERANCE
-            and member.low-TOLERANCE <= edge.anchor.model[member.axis] <= member.high+TOLERANCE
-            for member in hole.bores if member in members)]
+        if thread:
+            edges = (hole.rim,) if hole.rim.fraction >= .80 else ()
+        else:
+            edges = [edge for edge in hole.edges if any(
+                abs(edge.radius-member.radius) <= TOLERANCE
+                and member.low-TOLERANCE <= edge.anchor.model[member.axis] <= member.high+TOLERANCE
+                for member in hole.bores if member in members)]
         if edges:
             circle = max(edges, key=lambda edge: (edge.fraction, edge.anchor.sheet[2]))
-            anchors.append((circle.anchor, hole.center, hole.rim.radius*scale))
-    box, _, _ = text_geometry(item.annotation)
+            anchors.append((circle, hole.center, hole.rim.radius*scale))
+    box, angle, _ = text_geometry(item.annotation)
     if not anchors or box is None:
         return None
     width, height = box[2]-box[0], box[3]-box[1]
+    if angle is not None and abs(sin(angle)) > abs(cos(angle)):
+        width, height = height, width
     count_text = f"{len(group)} отв. "
     label_size = width + len(count_text)*height*.55, height
     obstacles = _centerline_strokes(holes, scale)
-    nominal = 2*bore.radius
-    for anchor, position, center, radius, accept in layout.free_diameter_routes(
-            item.view, item.annotation, anchors, label_size, obstacles):
-        annotation = _create(doc, item.view, Task((anchor,), DIAMETER, nominal, 0), position, matrix)
+    original = item.annotation if get_value(view, "GetName2") == get_value(item.view, "GetName2") else None
+    for circle, position, center, radius, accept in layout.free_diameter_routes(
+            view, original, anchors, label_size, obstacles, used_centers=used_centers,
+            allow_outline_exit=bool(thread) or _is_stepped(group, bore), refine=bool(thread)):
+        nominal = 2*(circle.radius if thread else bore.radius)
+        annotation = _create(doc, view, Task((circle.anchor,), DIAMETER, nominal, 0), position, matrix)
         if annotation is None:
             continue
         display = get_value(annotation, "GetSpecificAnnotation")
         retained = False
         try:
             display.DisplayAsLinear = False
-            get_value(display, "SetSecondArrow", False, False)
-            prefix = _optional(display, "GetText", 1) or "<MOD-DIAM>"
-            get_value(display, "SetText", 1, count_text + prefix)
-            get_value(doc, "GraphicsRedraw2")
-            box, _, text = text_geometry(annotation)
-            text = "".join(text).strip()
-            match = fullmatch(r"\d+\s+отв\.\s*(?:<MOD-DIAM>|[Ø⌀∅])\s*(\d+(?:[.,]\d+)?)", text)
-            if (match and text.startswith(count_text.strip())
-                    and isclose(float(match[1].replace(",", "."))/1000, nominal, abs_tol=TOLERANCE)
-                    and accept(annotation, center, radius) and _hide(item.annotation)):
-                layout.occupied.pop(layout._key(item.view, item.annotation), None)
-                layout.occupied[layout._key(item.view, annotation)] = box, dimension_lines(annotation)
-                retained = True
-                return annotation
+            get_value(display, "SetSecondArrow", False, bool(thread))
+            if thread:
+                # Keep the real opening as the attachment. Only the label is overridden.
+                get_value(display, "SetText", 0, count_text + thread)
+            else:
+                prefix = _optional(display, "GetText", 1) or "<MOD-DIAM>"
+                get_value(display, "SetText", 1, count_text + prefix)
+            for inside in ((False, True) if thread else (False,)):
+                if inside:
+                    display.ArrowSide = 0
+                get_value(doc, "GraphicsRedraw2")
+                box, _, parts = text_geometry(annotation)
+                text = "".join(parts).strip()
+                if thread:
+                    valid = text == count_text + thread and _arrows_span_hole(annotation, center, radius)
+                else:
+                    match = fullmatch(r"\d+\s+отв\.\s*(?:<MOD-DIAM>|[Ø⌀∅])\s*(\d+(?:[.,]\d+)?)", text)
+                    valid = (match and text.startswith(count_text.strip()) and
+                             isclose(float(match[1].replace(",", "."))/1000, nominal, abs_tol=TOLERANCE))
+                if valid and accept(annotation, center, radius) and _hide(item.annotation):
+                    layout.occupied.pop(layout._key(item.view, item.annotation), None)
+                    layout.occupied[layout._key(view, annotation)] = box, dimension_lines(annotation)
+                    used_centers.add(center)
+                    retained = True
+                    return annotation
         finally:
             if not retained:
-                _discard(doc, item.view, display, annotation)
+                _discard(doc, view, display, annotation)
     return None
 
 
-def _place_thread_group(doc, layout, item, group, thread):
+def _place_view_diameter(doc, layout, item, group, bore, matrix, holes, used_centers):
+    center = next(hole.center for hole in group if bore in hole.bores)
+    source = str(_optional(item.dimension, "FullName") or "")
+    # Model-owned diameter labels can lose their added quantity after reopening.
+    # For stepped holes prefer a drawing-owned leader, or reuse an uncrowded native one.
+    prefer_original = center not in used_centers and (not _is_stepped(group, bore) or source.lower().endswith(".drawing"))
+    if not prefer_original:
+        callout = _route_group_diameter(doc, layout, item.view, item, group, bore, matrix, holes,
+                                       used_centers=used_centers)
+        if callout is not None:
+            return callout
+    if _place_quantity(layout, item, len(group)):
+        used_centers.add(center)
+        return item.annotation
+    if prefer_original:
+        return _route_group_diameter(doc, layout, item.view, item, group, bore, matrix, holes,
+                                     used_centers=used_centers)
+    return None
+
+
+def _center_thread_note(doc, layout, view, note, hole, matrix, label):
+    if hole.rim.fraction < .80:
+        return note
+    key = layout._key(view, note)
+    box, previous = layout.occupied[key]
+    edges = layout.edges.get(get_value(view, "GetName2"), ())
+    other_lines = tuple(line for other, (_, lines) in layout.occupied.items() if other != key for line in lines)
+    # In a crowded projection, use the space already found for the note.
+    # The centered leader must introduce no additional crossings there.
+    original_crossings = _line_crossings(previous, edges), _line_crossings(previous, other_lines)
+    position = ((box[0]+box[2])/2, box[3]-.0008)
+    rim = hole.rim
+    annotation = _create(doc, view, Task((rim.anchor,), DIAMETER, 2*rim.radius, 0), position, matrix)
+    if annotation is None:
+        return note
+    display = get_value(annotation, "GetSpecificAnnotation")
+    occupied = layout.occupied.pop(key)
+    kept = False
+    try:
+        display.DisplayAsLinear = False
+        get_value(display, "SetSecondArrow", False, True)
+        get_value(display, "SetText", 0, label)
+        for inside in (False, True):
+            if inside:
+                display.ArrowSide = 0
+            get_value(doc, "GraphicsRedraw2")
+            if ("".join(text_geometry(annotation)[2]).strip() != label
+                    or not layout.place(view, annotation, DIAMETER)
+                    or not _arrows_span_hole(annotation, hole.center, rim.radius*matrix[12])):
+                continue
+            lines = dimension_lines(annotation)
+            if (_line_crossings(lines, edges) <= original_crossings[0]
+                    and _line_crossings(lines, other_lines) <= original_crossings[1]
+                    and _hide(note)):
+                kept = True
+                return annotation
+        return note
+    finally:
+        if not kept:
+            layout.occupied.pop(layout._key(view, annotation), None)
+            layout.occupied[key] = occupied
+            _discard(doc, view, display, annotation)
+
+
+def _place_thread_group(doc, layout, item, group, thread, matrix):
     # A model-owned thread dimension can reset its text when the drawing is
     # reopened. Create a drawing-owned leader attached to a verified rim.
     origin = _optional(item.annotation, "GetPosition")
@@ -370,7 +485,12 @@ def _place_thread_group(doc, layout, item, group, thread):
             return None
         annotation.Color = 0
         kept = layout.place(item.view, annotation, DIAMETER) and _hide(item.annotation)
-        return annotation if kept else None
+        if not kept:
+            return None
+        try:
+            return _center_thread_note(doc, layout, item.view, annotation, hole, matrix, label)
+        except (AttributeError, com_error):
+            return annotation
     finally:
         get_value(doc, "ClearSelection2", True)
         if not kept:
@@ -385,7 +505,7 @@ def _place_thread_group(doc, layout, item, group, thread):
         get_value(doc, "ActivateView", "")
 
 
-def _add_view_quantities(doc, view, holes, matrix, layout):
+def _add_view_quantities(doc, view, holes, matrix, layout, used_centers):
     """Keep the native dimension and prefix its verified number of holes."""
     groups = _groups(holes)
     applicable = {(bore, hole.thread): group for group in groups for hole in group
@@ -395,6 +515,7 @@ def _add_view_quantities(doc, view, holes, matrix, layout):
     bores = tuple(dict.fromkeys(bore for hole in holes for bore in hole.bores))
     assigned = set()
     placed = []
+    covered_tap_drills = set()
     hidden = 0
     name = get_value(view, "GetName2")
     for item in layout.items:
@@ -415,46 +536,89 @@ def _add_view_quantities(doc, view, holes, matrix, layout):
                 hidden += 1
             continue
         if thread:
-            annotation = _place_thread_group(doc, layout, item, group, thread)
-        elif _place_quantity(layout, item, len(group)):
-            annotation = item.annotation
+            try:
+                annotation = _route_group_diameter(doc, layout, view, item, group, None, matrix, holes,
+                                                   used_centers=used_centers, thread=thread)
+            except (AttributeError, com_error):
+                annotation = None
+            if annotation is None:
+                annotation = _place_thread_group(doc, layout, item, group, thread, matrix)
         else:
-            annotation = _relocate_group_diameter(doc, layout, item, group, bore, matrix, holes)
+            annotation = _place_view_diameter(doc, layout, item, group, bore, matrix, holes, used_centers)
         if annotation is not None:
             assigned.add(key)
             placed.append((_covered_bores(group, None if thread else bore), thread_name, annotation))
-    return placed, hidden
+            if thread:
+                covered_tap_drills.update(hole.tap_drill for hole in group if hole.tap_drill is not None)
+    return placed, hidden, covered_tap_drills
+
+
+def _hide_redundant_tap_drill_diameters(layout, hole_views, covered_tap_drills):
+    views = {}
+    for view, holes, matrix, flat in hole_views:
+        if flat or get_value(view, "Type") == 2:
+            continue
+        bores = {bore for hole in holes for bore in hole.bores}
+        if not covered_tap_drills.isdisjoint(bores):
+            views[get_value(view, "GetName2")] = matrix, tuple(bores)
+    hidden = 0
+    for item in layout.items:
+        projection = views.get(get_value(item.view, "GetName2"))
+        if projection is None or item.kind != DIAMETER or _optional(item.annotation, "Visible") != VISIBLE:
+            continue
+        name = str(_optional(item.dimension, "FullName") or "")
+        if not name.lower().endswith(".drawing") or _optional(item.annotation, "IsDangling"):
+            continue
+        matrix, bores = projection
+        label = _diameter_label(item.display, item.annotation, item.dimension, matrix, bores)
+        if label is not None and not label[1] and label[0] in covered_tap_drills and _hide(item.annotation):
+            layout.occupied.pop(layout._key(item.view, item.annotation), None)
+            hidden += 1
+    return hidden
 
 
 def add_hole_quantities(doc, frame, hole_views, cut_diameters):
-    if not any(not flat and _groups(holes) for _, holes, _, flat in hole_views):
+    end_projections = [(view, holes, matrix) for view, holes, matrix, flat in hole_views
+                       if not flat and get_value(view, "Type") != 2 and _groups(holes)]
+    if not end_projections:
         return 0, 0
     layout = DimensionTextLayout(doc, frame)
-    memberships = defaultdict(set)
+    end_views = defaultdict(list)
+    used_centers = defaultdict(set)
     placed = []
+    covered_tap_drills = set()
     hidden = 0
-    for view, holes, matrix, flat in hole_views:
-        if flat:
-            continue
-        current, removed = _add_view_quantities(doc, view, holes, matrix, layout)
+    for view, holes, matrix in end_projections:
+        current, removed, taps = _add_view_quantities(doc, view, holes, matrix, layout,
+                                                      used_centers[get_value(view, "GetName2")])
         placed.extend(current)
         hidden += removed
+        covered_tap_drills.update(taps)
         for group in _groups(holes):
             if group[0].profile[2]:  # cosmetic threads have their own annotation
                 continue
-            for hole in group:
-                for bore in hole.bores:
-                    memberships[bore].add((len(group), _covered_bores(group, bore)))
+            for bore in _covered_bores(group, None):
+                end_views[bore].append((view, holes, matrix, group))
     by_name = {get_value(item.annotation, "GetName"): item for item in layout.items
                if get_value(item.view, "Type") == 2}
     for bore, annotation in cut_diameters:
-        groups = memberships.get(bore)
-        item = by_name.get(get_value(annotation, "GetName")) if groups else None
-        if item is not None and len(groups) == 1 and _plain_diameter(
-                _optional(annotation, "GetDisplayData"), 2*bore.radius):
-            count, footprint = next(iter(groups))
-            if _place_quantity(layout, item, count):
-                placed.append((footprint, "", item.annotation))
+        candidates = end_views.get(bore)
+        item = by_name.get(get_value(annotation, "GetName")) if candidates else None
+        if item is None or not _plain_diameter(_optional(annotation, "GetDisplayData"), 2*bore.radius):
+            continue
+        if any(not thread and bore in footprint for footprint, thread, _ in placed):
+            if _hide(annotation):
+                layout.occupied.pop(layout._key(item.view, annotation), None)
+                hidden += 1
+            continue
+        # A cut diameter can supply the nominal size. Its quantity belongs
+        # with a visible circular opening of the same bore in an end view.
+        for view, holes, matrix, group in sorted(candidates, key=lambda row: -len(row[3])):
+            callout = _route_group_diameter(doc, layout, view, item, group, bore, matrix, holes,
+                                           used_centers=used_centers[get_value(view, "GetName2")])
+            if callout is not None:
+                placed.append((_covered_bores(group, bore), "", callout))
+                break
     # The reverse projection can show a complete group while the front
     # exposes only part of it. Suppress the lesser label only when its
     # physical holes are all covered by another successful callout.
@@ -466,4 +630,6 @@ def add_hole_quantities(doc, frame, hole_views, cut_diameters):
                 redundant += 1
                 continue
         retained.append((footprint, thread))
+    if covered_tap_drills:
+        hidden += _hide_redundant_tap_drill_diameters(layout, hole_views, covered_tap_drills)
     return len(placed)-redundant, hidden+redundant
